@@ -28,14 +28,14 @@ Este é um projeto de PIBIC que está sendo desenvolvido para maternidades e ser
   - Acompanhamento em andamento
   - Recuperação adequada
 
-##Tecnologias Utilizadas
+## Tecnologias Utilizadas
 
 - **Python 3.8+**
 - **python-telegram-bot** - Framework para bots do Telegram
 - **Logging** - Registro de atividades e dados
 - **Asyncio** - Programação assíncrona
 
-##Instalação
+## Instalação
 
 ### Pré-requisitos
 
