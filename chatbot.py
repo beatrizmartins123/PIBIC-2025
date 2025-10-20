@@ -506,7 +506,7 @@ def main():
     # Inicializa o arquivo CSV
     inicializar_csv()
     
-    # Token do seu bot 
+    # Token do bot 
     TOKEN = "8441175313:AAF3UlhGCijQwZR09aQNFuN372DMPIL4Hgs"
     
     application = Application.builder().token(TOKEN).build()
