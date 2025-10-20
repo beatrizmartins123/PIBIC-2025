@@ -1,4 +1,6 @@
 import logging
+import csv
+import os
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -15,16 +17,125 @@ logging.basicConfig(
 # Estados da conversação
 ACEITAR, NOME, DATA_PARTO, PERGUNTA_1, PERGUNTA_2, PERGUNTA_3, PERGUNTA_4, PERGUNTA_5, PERGUNTA_6, PERGUNTA_7, PERGUNTA_8, PERGUNTA_9, PERGUNTA_10, PERGUNTA_11, PERGUNTA_12, PERGUNTA_13, PERGUNTA_14, PERGUNTA_15, PERGUNTA_16, PERGUNTA_17 = range(20)
 
+# Nome do arquivo CSV
+CSV_FILENAME = "dados_pacientes.csv"
+
 # Dados do paciente
 class Paciente:
     def __init__(self):
         self.nome = ""
         self.data_parto = ""
         self.respostas = {}
+        self.data_preenchimento = ""
+        self.telegram_user_id = ""
+
+# Função para inicializar o arquivo CSV com cabeçalhos
+def inicializar_csv():
+    if not os.path.exists(CSV_FILENAME):
+        with open(CSV_FILENAME, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            # Cabeçalhos
+            headers = [
+                'Data_Preenchimento', 'Telegram_User_ID', 'Nome', 'Data_Parto',
+                'P1_Sintomas', 'P2_Sangramento', 'P3_Edema_Local', 'P4_Edema_Pernas',
+                'P5_Falta_Ar', 'P6_Nausea_Vomito', 'P7_Defecacao', 'P8_Vermelhidão',
+                'P9_Calor_Local', 'P10_Secrecao', 'P11_Cor_Secrecao', 'P12_Ferida_Aberta',
+                'P13_Mal_Cheiro', 'P14_Consulta_Resguardo', 'P15_Exames_Pos_Alta',
+                'P16_Reinternacao', 'P17_Duvidas_Cuidados', 'Recomendacao'
+            ]
+            writer.writerow(headers)
+
+# Função para salvar dados no CSV
+def salvar_no_csv(paciente, telegram_user_id, recomendacao):
+    try:
+        with open(CSV_FILENAME, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Prepara os dados para a linha
+            linha = [
+                paciente.data_preenchimento,
+                telegram_user_id,
+                paciente.nome,
+                paciente.data_parto,
+                paciente.respostas.get('pergunta_1', ''),
+                paciente.respostas.get('pergunta_2', ''),
+                paciente.respostas.get('pergunta_3', ''),
+                paciente.respostas.get('pergunta_4', ''),
+                paciente.respostas.get('pergunta_5', ''),
+                paciente.respostas.get('pergunta_6', ''),
+                paciente.respostas.get('pergunta_7', ''),
+                paciente.respostas.get('pergunta_8', ''),
+                paciente.respostas.get('pergunta_9', ''),
+                paciente.respostas.get('pergunta_10', ''),
+                paciente.respostas.get('pergunta_11', ''),
+                paciente.respostas.get('pergunta_12', ''),
+                paciente.respostas.get('pergunta_13', ''),
+                paciente.respostas.get('pergunta_14', ''),
+                paciente.respostas.get('pergunta_15', ''),
+                paciente.respostas.get('pergunta_16', ''),
+                paciente.respostas.get('pergunta_17', ''),
+                recomendacao
+            ]
+            
+            writer.writerow(linha)
+        logging.info(f"Dados salvos no CSV para o paciente: {paciente.nome}")
+        return True
+    except Exception as e:
+        logging.error(f"Erro ao salvar no CSV: {e}")
+        return False
+
+# Função para validar data no formato DD/MM/AAAA
+def validar_data(data_str):
+    try:
+        # Tenta fazer o parsing da data
+        data = datetime.strptime(data_str, '%d/%m/%Y')
+        
+        # Verifica se a data não é no futuro
+        if data > datetime.now():
+            return False, "Data não pode ser no futuro."
+        
+        return True, data
+    except ValueError:
+        return False, "Formato inválido."
+
+# Função para validar nome (apenas letras e espaços)
+def validar_nome(nome_str):
+    # Remove espaços extras no início e fim
+    nome_limpo = nome_str.strip()
+    
+    # Verifica se o nome não está vazio
+    if not nome_limpo:
+        return False, "Nome não pode estar vazio."
+    
+    # Verifica se o nome tem pelo menos 2 caracteres
+    if len(nome_limpo) < 2:
+        return False, "Nome deve ter pelo menos 2 caracteres."
+    
+    # Verifica se contém apenas letras, espaços e alguns caracteres especiais comuns em nomes
+    # Permitindo: letras, espaços, hífens e afins... :3
+    import re
+    padrao = r'^[a-zA-ZÀ-ÿ\s\-\']+$'
+    
+    if not re.match(padrao, nome_limpo):
+        return False, "Nome deve conter apenas letras e espaços."
+    
+    # Verifica se tem pelo menos um espaço (nome e sobrenome)
+    if ' ' not in nome_limpo:
+        return False, "Por favor, digite seu nome completo (nome e sobrenome)."
+    
+    # Verifica se cada parte do nome tem pelo menos 2 caracteres
+    partes_nome = nome_limpo.split()
+    for parte in partes_nome:
+        if len(parte) < 2:
+            return False, "Cada parte do nome deve ter pelo menos 2 caracteres."
+    
+    return True, nome_limpo
 
 # Início da conversa
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['paciente'] = Paciente()
+    context.user_data['paciente'].telegram_user_id = update.effective_user.id
+    context.user_data['paciente'].data_preenchimento = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     
     keyboard = [
         [KeyboardButton("SIM"), KeyboardButton("NÃO")]
@@ -58,12 +169,36 @@ async def aceitar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return NOME
 
 async def obter_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].nome = update.message.text
+    nome_input = update.message.text
+    
+    # Valida o nome
+    valido, resultado = validar_nome(nome_input)
+    
+    if not valido:
+        await update.message.reply_text(
+            f"Nome inválido! {resultado}\n"
+            "Por favor, digite seu nome completo (ex: Maria Silva Santos):"
+        )
+        return NOME  # Permanece no mesmo estado para nova tentativa
+    
+    context.user_data['paciente'].nome = resultado
     await update.message.reply_text("Informe a data do parto (ex: 01/01/2024):")
     return DATA_PARTO
 
 async def obter_data_parto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].data_parto = update.message.text
+    data_input = update.message.text
+    
+    # Valida o formato da data
+    valido, resultado = validar_data(data_input)
+    
+    if not valido:
+        await update.message.reply_text(
+            f"Data inválida! {resultado}\n"
+            "Por favor, digite a data no formato DD/MM/AAAA (ex: 15/03/2024):"
+        )
+        return DATA_PARTO  # Permanece no mesmo estado para nova tentativa
+    
+    context.user_data['paciente'].data_parto = data_input
     
     keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
@@ -146,7 +281,7 @@ async def pergunta_6(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     
     await update.message.reply_text(
-        "7. Desde que chegou em casa, você tem defecado (evacuado, fez o número 2)? Quantas vezes? Escolha uma das opções:",
+        "7. Desde que chegou em casa, você tem defecado 💩? Quantas vezes? Escolha uma das opções:",
         reply_markup=reply_markup
     )
     return PERGUNTA_7
@@ -296,14 +431,30 @@ async def pergunta_17(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Análise dos resultados
     recomendacao = analisar_respostas(context.user_data['paciente'])
     
-    await update.message.reply_text(
-        f"Pronto! Terminamos.\n\n{recomendacao}\n\n"
-        "Agora, caso preferir, você pode anexar exames ou uma foto da sua ferida operatória.\n"
-        "Muito obrigada por sua participação!",
-        reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
+    # Salva os dados no CSV
+    sucesso = salvar_no_csv(
+        context.user_data['paciente'],
+        context.user_data['paciente'].telegram_user_id,
+        recomendacao
     )
     
-    # Log dos dados (em produção, salvaria em banco de dados)
+    if sucesso:
+        await update.message.reply_text(
+            f"Pronto! Terminamos.\n\n{recomendacao}\n\n"
+            "Agora, caso preferir, você pode anexar exames ou uma foto da sua ferida operatória.\n"
+            "Muito obrigada por sua participação!",
+            reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
+        )
+    else:
+        await update.message.reply_text(
+            f"Pronto! Terminamos.\n\n{recomendacao}\n\n"
+            "Agora, caso preferir, você pode anexar exames ou uma foto da sua ferida operatória.\n"
+            "Muito obrigada por sua participação!\n\n"
+            "⚠️ Observação: Houve um problema técnico ao salvar seus dados. Por favor, entre em contato com a maternidade.",
+            reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
+        )
+    
+    # Log dos dados
     logging.info(f"Paciente: {context.user_data['paciente'].nome}")
     logging.info(f"Data parto: {context.user_data['paciente'].data_parto}")
     logging.info(f"Respostas: {context.user_data['paciente'].respostas}")
@@ -352,7 +503,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    # Token do bot
+    # Inicializa o arquivo CSV
+    inicializar_csv()
+    
+    # Token do seu bot 
     TOKEN = "8441175313:AAF3UlhGCijQwZR09aQNFuN372DMPIL4Hgs"
     
     application = Application.builder().token(TOKEN).build()
@@ -388,6 +542,7 @@ def main():
     application.add_handler(conv_handler)
 
     print("Bot de monitoramento pós-cesárea está rodando...")
+    print(f"Os dados serão salvos no arquivo: {CSV_FILENAME}")
     application.run_polling()
 
 if __name__ == '__main__':
