@@ -1,12 +1,29 @@
 import logging
 import csv
 import os
+import re
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, 
     ContextTypes, ConversationHandler
 )
+
+#Importar spaCy
+try:
+    import spacy
+    # Carregar modelo em português
+    nlp = spacy.load("pt_core_news_sm")
+    SPACY_AVAILABLE = True
+    print(" spaCy carregado com sucesso!")
+except ImportError:
+    print(" spaCy não instalado. Use: pip install spacy")
+    print(" E depois: python -m spacy download pt_core_news_sm")
+    SPACY_AVAILABLE = False
+except OSError:
+    print("Modelo pt_core_news_sm não encontrado.")
+    print(" Execute: python -m spacy download pt_core_news_sm")
+    SPACY_AVAILABLE = False
 
 # Configuração do logging
 logging.basicConfig(
@@ -15,124 +32,49 @@ logging.basicConfig(
 )
 
 # Estados da conversação
-ACEITAR, NOME, DATA_PARTO, PERGUNTA_1, PERGUNTA_2, PERGUNTA_3, PERGUNTA_4, PERGUNTA_5, PERGUNTA_6, PERGUNTA_7, PERGUNTA_8, PERGUNTA_9, PERGUNTA_10, PERGUNTA_11, PERGUNTA_12, PERGUNTA_13, PERGUNTA_14, PERGUNTA_15, PERGUNTA_16, PERGUNTA_17 = range(20)
+ACEITAR, INICIAIS, DATA_NASCIMENTO, DATA_PARTO, PERGUNTA_A, PERGUNTA_B, PERGUNTA_C = range(7)
 
 # Nome do arquivo CSV
 CSV_FILENAME = "dados_pacientes.csv"
 
+#Dicionários de sinônimos e mapeamento para o spaCy
+MApeamento_SINTOMAS = {
+    'febre': ['febre', 'calor', 'temperatura', 'quente', 'aquecida', 'febril', '37.5', '38'],
+    'calafrio': ['calafrio', 'tremedeira', 'tremor', 'calafrios', 'tremendo'],
+    'dor_corpo': ['dor', 'dores', 'corpo dolorido', 'dói', 'dor no corpo', 'dores no corpo'],
+    'nenhum_sintoma': ['nenhum', 'nada', 'tudo bem', 'estou bem', 'não sinto nada']
+}
+
+Mapeamento_SINAIS = {
+    'sangramento': ['sangramento', 'sangrando', 'sangra', 'sangue'],
+    'secrecao': ['líquido amarelo', 'líquido esverdeado', 'líquido marrom', 'secreção', 'pus', 'corrimento', 'amarelo', 'verde', 'marrom'],
+    'vermelhidao': ['vermelhidão', 'vermelho', 'avermelhado', 'inchado', 'inflamado'],
+    'calor_local': ['quente', 'calor', 'aquecido', 'ardendo'],
+    'pontos_abertos': ['abriu', 'pontos abertos', 'pontos soltos', 'arrebentou', 'rompeu'],
+    'mal_cheiro': ['mal cheiro', 'fedendo', 'fedor', 'cheiro ruim'],
+    'nenhum_sinal': ['nenhum', 'nada', 'tudo normal', 'está bom']
+}
+
 # Dados do paciente
 class Paciente:
     def __init__(self):
-        self.nome = ""
+        self.iniciais = ""
+        self.data_nascimento = ""
         self.data_parto = ""
         self.respostas = {}
         self.data_preenchimento = ""
         self.telegram_user_id = ""
 
-# Função para inicializar o arquivo CSV com cabeçalhos
-def inicializar_csv():
-    if not os.path.exists(CSV_FILENAME):
-        with open(CSV_FILENAME, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            # Cabeçalhos
-            headers = [
-                'Data_Preenchimento', 'Telegram_User_ID', 'Nome', 'Data_Parto',
-                'P1_Sintomas', 'P2_Sangramento', 'P3_Edema_Local', 'P4_Edema_Pernas',
-                'P5_Falta_Ar', 'P6_Nausea_Vomito', 'P7_Defecacao', 'P8_Vermelhidão',
-                'P9_Calor_Local', 'P10_Secrecao', 'P11_Cor_Secrecao', 'P12_Ferida_Aberta',
-                'P13_Mal_Cheiro', 'P14_Consulta_Resguardo', 'P15_Exames_Pos_Alta',
-                'P16_Reinternacao', 'P17_Duvidas_Cuidados', 'Recomendacao'
-            ]
-            writer.writerow(headers)
-
-# Função para salvar dados no CSV
-def salvar_no_csv(paciente, telegram_user_id, recomendacao):
-    try:
-        with open(CSV_FILENAME, 'a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            
-            # Prepara os dados para a linha
-            linha = [
-                paciente.data_preenchimento,
-                telegram_user_id,
-                paciente.nome,
-                paciente.data_parto,
-                paciente.respostas.get('pergunta_1', ''),
-                paciente.respostas.get('pergunta_2', ''),
-                paciente.respostas.get('pergunta_3', ''),
-                paciente.respostas.get('pergunta_4', ''),
-                paciente.respostas.get('pergunta_5', ''),
-                paciente.respostas.get('pergunta_6', ''),
-                paciente.respostas.get('pergunta_7', ''),
-                paciente.respostas.get('pergunta_8', ''),
-                paciente.respostas.get('pergunta_9', ''),
-                paciente.respostas.get('pergunta_10', ''),
-                paciente.respostas.get('pergunta_11', ''),
-                paciente.respostas.get('pergunta_12', ''),
-                paciente.respostas.get('pergunta_13', ''),
-                paciente.respostas.get('pergunta_14', ''),
-                paciente.respostas.get('pergunta_15', ''),
-                paciente.respostas.get('pergunta_16', ''),
-                paciente.respostas.get('pergunta_17', ''),
-                recomendacao
-            ]
-            
-            writer.writerow(linha)
-        logging.info(f"Dados salvos no CSV para o paciente: {paciente.nome}")
-        return True
-    except Exception as e:
-        logging.error(f"Erro ao salvar no CSV: {e}")
-        return False
-
-# Função para validar data no formato DD/MM/AAAA
-def validar_data(data_str):
-    try:
-        # Tenta fazer o parsing da data
-        data = datetime.strptime(data_str, '%d/%m/%Y')
-        
-        # Verifica se a data não é no futuro
-        if data > datetime.now():
-            return False, "Data não pode ser no futuro."
-        
-        return True, data
-    except ValueError:
-        return False, "Formato inválido."
-
-# Função para validar nome (apenas letras e espaços)
-def validar_nome(nome_str):
-    # Remove espaços extras no início e fim
-    nome_limpo = nome_str.strip()
+#Função para iniciar com QUALQUER mensagem
+async def iniciar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia a conversa quando o usuário envia QUALQUER mensagem"""
     
-    # Verifica se o nome não está vazio
-    if not nome_limpo:
-        return False, "Nome não pode estar vazio."
+    # Verifica se já existe uma conversa em andamento
+    if 'paciente' in context.user_data:
+        # Se já existe uma conversa, não reinicia
+        return await handle_mensagem_qualquer(update, context)
     
-    # Verifica se o nome tem pelo menos 2 caracteres
-    if len(nome_limpo) < 2:
-        return False, "Nome deve ter pelo menos 2 caracteres."
-    
-    # Verifica se contém apenas letras, espaços e alguns caracteres especiais comuns em nomes
-    # Permitindo: letras, espaços, hífens e afins... :3
-    import re
-    padrao = r'^[a-zA-ZÀ-ÿ\s\-\']+$'
-    
-    if not re.match(padrao, nome_limpo):
-        return False, "Nome deve conter apenas letras e espaços."
-    
-    # Verifica se tem pelo menos um espaço (nome e sobrenome)
-    if ' ' not in nome_limpo:
-        return False, "Por favor, digite seu nome completo (nome e sobrenome)."
-    
-    # Verifica se cada parte do nome tem pelo menos 2 caracteres
-    partes_nome = nome_limpo.split()
-    for parte in partes_nome:
-        if len(parte) < 2:
-            return False, "Cada parte do nome deve ter pelo menos 2 caracteres."
-    
-    return True, nome_limpo
-
-# Início da conversa
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Inicia nova conversa
     context.user_data['paciente'] = Paciente()
     context.user_data['paciente'].telegram_user_id = update.effective_user.id
     context.user_data['paciente'].data_preenchimento = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
@@ -143,406 +85,608 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     
     await update.message.reply_text(
-        "Olá! Sou enfermeira do controle de Infecção Hospitalar da Maternidade e "
-        "gostaria de contribuir com seu cuidado pós-operatório, fazendo algumas perguntas. "
+        "👋 Olá! Sou assistente virtual da Comissão de Controle de Vigilância Hospitalar e "
+        "gostaria de saber como você está após seu parto cesariano para garantir que "
+        "sua recuperação esteja indo bem. Serão apenas 5 minutos, onde faremos 3 perguntas "
+        "com alternativas de resposta.\n\n"
         "Você aceita seguir com a conversa nesse momento?",
         reply_markup=reply_markup
     )
     return ACEITAR
+
+async def handle_mensagem_qualquer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lida com mensagens enviadas durante conversas em andamento"""
+    await update.message.reply_text(
+        "🤔 Você já tem uma conversa em andamento. "
+        "Se quiser recomeçar, use /start para iniciar uma nova conversa.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
+
+#Função start tradicional para quem preferir usar o comando
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Função start tradicional - opcional"""
+    context.user_data['paciente'] = Paciente()
+    context.user_data['paciente'].telegram_user_id = update.effective_user.id
+    context.user_data['paciente'].data_preenchimento = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+    
+    keyboard = [
+        [KeyboardButton("SIM"), KeyboardButton("NÃO")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    
+    await update.message.reply_text(
+        "👋 Olá! Sou assistente virtual da Comissão de Controle de Vigilância Hospitalar e "
+        "gostaria de saber como você está após seu parto cesariano para garantir que "
+        "sua recuperação esteja indo bem. Serão apenas 5 minutos, onde faremos 3 perguntas "
+        "com alternativas de resposta.\n\n"
+        "Você aceita seguir com a conversa nesse momento?",
+        reply_markup=reply_markup
+    )
+    return ACEITAR
+
+#Funções de Processamento de Linguagem Natural com spaCy
+def processar_texto_spacy(texto):
+    """Processa texto usando spaCy para extrair informações relevantes"""
+    if not SPACY_AVAILABLE:
+        return processar_texto_simples(texto)
+    
+    doc = nlp(texto.lower())
+    
+    # Extrair tokens relevantes (remover stop words)
+    tokens_relevantes = []
+    for token in doc:
+        if not token.is_stop and not token.is_punct and token.is_alpha:
+            tokens_relevantes.append(token.lemma_)
+    
+    return tokens_relevantes
+
+def identificar_sintomas(texto):
+    """Identifica sintomas no texto usando spaCy"""
+    tokens = processar_texto_spacy(texto)
+    
+    sintomas_identificados = []
+    
+    for token in tokens:
+        for sintoma, sinônimos in MApeamento_SINTOMAS.items():
+            if any(sinônimo in token for sinônimo in sinônimos):
+                if sintoma not in sintomas_identificados and sintoma != 'nenhum_sintoma':
+                    sintomas_identificados.append(sintoma)
+    
+    # Verificar se mencionou "nenhum sintoma"
+    texto_limpo = texto.lower()
+    for palavra in MApeamento_SINTOMAS['nenhum_sintoma']:
+        if palavra in texto_limpo:
+            return ['4']  # Retorna código para "nenhum sintoma"
+    
+    # Mapear para códigos numéricos
+    codigos = []
+    for sintoma in sintomas_identificados:
+        if sintoma == 'febre':
+            codigos.append('1')
+        elif sintoma == 'calafrio':
+            codigos.append('2')
+        elif sintoma == 'dor_corpo':
+            codigos.append('3')
+    
+    return codigos if codigos else None
+
+def identificar_sinais_cesariana(texto):
+    """Identifica sinais na cesariana usando spaCy"""
+    tokens = processar_texto_spacy(texto)
+    
+    sinais_identificados = []
+    
+    for token in tokens:
+        for sinal, sinônimos in Mapeamento_SINAIS.items():
+            if any(sinônimo in token for sinônimo in sinônimos):
+                if sinal not in sinais_identificados and sinal != 'nenhum_sinal':
+                    sinais_identificados.append(sinal)
+    
+    # Verificar se mencionou "nenhum sinal"
+    texto_limpo = texto.lower()
+    for palavra in Mapeamento_SINAIS['nenhum_sinal']:
+        if palavra in texto_limpo:
+            return ['7']  # Retorna código para "nenhum sinal"
+    
+    # Mapear para códigos numéricos
+    codigos = []
+    for sinal in sinais_identificados:
+        if sinal == 'sangramento':
+            codigos.append('1')
+        elif sinal == 'secrecao':
+            codigos.append('2')
+        elif sinal == 'vermelhidao':
+            codigos.append('3')
+        elif sinal == 'calor_local':
+            codigos.append('4')
+        elif sinal == 'pontos_abertos':
+            codigos.append('5')
+        elif sinal == 'mal_cheiro':
+            codigos.append('6')
+    
+    return codigos if codigos else None
+
+def processar_texto_simples(texto):
+    """Fallback se spaCy não estiver disponível"""
+    texto = texto.lower()
+    
+    # Verificação simples por palavras-chave
+    sintomas = []
+    if any(palavra in texto for palavra in ['febre', 'calor', 'temperatura']):
+        sintomas.append('1')
+    if any(palavra in texto for palavra in ['calafrio', 'tremedeira', 'tremor']):
+        sintomas.append('2')
+    if any(palavra in texto for palavra in ['dor', 'dores', 'dói']):
+        sintomas.append('3')
+    if any(palavra in texto for palavra in ['nenhum', 'nada', 'tudo bem']):
+        return ['4']
+    
+    return sintomas if sintomas else None
+
+# Função para inicializar o arquivo CSV com cabeçalhos
+def inicializar_csv():
+    if not os.path.exists(CSV_FILENAME):
+        with open(CSV_FILENAME, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            headers = [
+                'Data_Preenchimento', 'Telegram_User_ID', 'Iniciais_Nome', 
+                'Data_Nascimento', 'Data_Parto', 'Pergunta_A_Sintomas',
+                'Pergunta_B_Tempo_Sintomas', 'Pergunta_C_Sinais_Cesariana',
+                'Recomendacao', 'Alerta_Risco', 'Texto_Original_A', 'Texto_Original_C'
+            ]
+            writer.writerow(headers)
+
+#Função para salvar dados no CSV
+def salvar_no_csv(paciente, telegram_user_id, recomendacao, alerta_risco, texto_original_a="", texto_original_c=""):
+    try:
+        with open(CSV_FILENAME, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            linha = [
+                paciente.data_preenchimento,
+                telegram_user_id,
+                paciente.iniciais,
+                paciente.data_nascimento,
+                paciente.data_parto,
+                paciente.respostas.get('pergunta_a', ''),
+                paciente.respostas.get('pergunta_b', ''),
+                paciente.respostas.get('pergunta_c', ''),
+                recomendacao,
+                alerta_risco,
+                texto_original_a,
+                texto_original_c
+            ]
+            
+            writer.writerow(linha)
+        logging.info(f"Dados salvos no CSV para: {paciente.iniciais}")
+        return True
+    except Exception as e:
+        logging.error(f"Erro ao salvar no CSV: {e}")
+        return False
+
+# Função para validar data no formato DD/MM/AAAA
+def validar_data(data_str, tipo="nascimento"):
+    try:
+        data = datetime.strptime(data_str, '%d/%m/%Y')
+        
+        if tipo == "nascimento":
+            if data > datetime.now():
+                return False, "Data de nascimento não pode ser no futuro."
+        elif tipo == "parto":
+            if data > datetime.now():
+                return False, "Data do parto não pode ser no futuro."
+        
+        return True, data_str
+    except ValueError:
+        return False, "Formato inválido. Use DD/MM/AAAA."
+
+#Função para validar APENAS iniciais
+def validar_iniciais(iniciais_str):
+    iniciais_limpas = iniciais_str.strip().upper()
+    
+    if not iniciais_limpas:
+        return False, "Iniciais não podem estar vazias."
+    
+    if not re.match(r'^[A-ZÀ-ÿ]+$', iniciais_limpas.replace(' ', '')):
+        return False, "Use apenas letras para as iniciais (sem números ou caracteres especiais)."
+    
+    if len(iniciais_limpas.replace(' ', '')) > 10:
+        return False, "Por favor, digite apenas as iniciais (máximo 10 letras). Ex: PRN"
+    
+    if len(iniciais_limpas.replace(' ', '')) < 2:
+        return False, "Digite pelo menos 2 letras para as iniciais."
+    
+    return True, iniciais_limpas
 
 async def aceitar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     resposta = update.message.text.upper()
     
     if resposta == "NÃO":
         await update.message.reply_text(
-            "Entendo. Informamos que essa conversa é muito importante para sua saúde. "
-            "Aguardamos seu retorno.",
-            reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
+            "Retorne com seu médico ou enfermeira do pré-natal para sua consulta de resguardo "
+            "e em caso de sintomas como febre, vermelhidão e secreção no local da cesariana "
+            "retorna à maternidade onde realizou o parto.",
+            reply_markup=ReplyKeyboardRemove()
         )
         return ConversationHandler.END
     elif resposta == "SIM":
         await update.message.reply_text(
-            "Maravilha! Nessa conversa você responde escolhendo a alternativa com a qual "
-            "mais se identifica. Antes, confirme seu nome completo:",
-            reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
+            "Maravilha! Antes, digite apenas as **iniciais do seu nome**.\n\n"
+            "💡 *Exemplos:*\n"
+            "• Patrícia Rodrigues Nunes → **PRN**\n"
+            "• Maria Silva → **MS**\n"
+            "• Ana Clara Santos → **ACS**\n\n"
+            "Por favor, digite apenas as iniciais:",
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode='Markdown'
         )
-        return NOME
+        return INICIAIS
 
-async def obter_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    nome_input = update.message.text
+async def obter_iniciais(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    iniciais_input = update.message.text.upper()
     
-    # Valida o nome
-    valido, resultado = validar_nome(nome_input)
+    valido, resultado = validar_iniciais(iniciais_input)
     
     if not valido:
         await update.message.reply_text(
-            f"Nome inválido! {resultado}\n"
-            "Por favor, digite seu nome completo (ex: Maria Silva Santos):"
+            f"✋ {resultado}\n\n"
+            "💡 *Digite apenas as iniciais:*\n"
+            "• Exemplo 1: PRN\n"
+            "• Exemplo 2: MS\n"
+            "• Exemplo 3: ACS\n\n"
+            "Por favor, digite novamente as iniciais:",
+            parse_mode='Markdown'
         )
-        return NOME  # Permanece no mesmo estado para nova tentativa
+        return INICIAIS
     
-    context.user_data['paciente'].nome = resultado
-    await update.message.reply_text("Informe a data do parto (ex: 01/01/2024):")
+    context.user_data['paciente'].iniciais = resultado
+    await update.message.reply_text("Informe sua data de nascimento (ex: 08/11/1987):")
+    return DATA_NASCIMENTO
+
+async def obter_data_nascimento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data_input = update.message.text
+    
+    valido, resultado = validar_data(data_input, "nascimento")
+    
+    if not valido:
+        await update.message.reply_text(
+            f"Data inválida! {resultado}\n"
+            "Por favor, digite no formato DD/MM/AAAA (ex: 08/11/1987):"
+        )
+        return DATA_NASCIMENTO
+    
+    context.user_data['paciente'].data_nascimento = data_input
+    await update.message.reply_text("Informe a data do parto (ex: 23/05/2025):")
     return DATA_PARTO
 
 async def obter_data_parto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data_input = update.message.text
     
-    # Valida o formato da data
-    valido, resultado = validar_data(data_input)
+    valido, resultado = validar_data(data_input, "parto")
     
     if not valido:
         await update.message.reply_text(
             f"Data inválida! {resultado}\n"
-            "Por favor, digite a data no formato DD/MM/AAAA (ex: 15/03/2024):"
+            "Por favor, digite no formato DD/MM/AAAA (ex: 23/05/2025):"
         )
-        return DATA_PARTO  # Permanece no mesmo estado para nova tentativa
+        return DATA_PARTO
     
     context.user_data['paciente'].data_parto = data_input
     
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "Vamos às perguntas! Ah, uma dica: vamos chamar o local da cirurgia de ferida operatória 😉\n\n"
-        "1. Você apresentou sintomas (calafrios, tremedeira, febre: T= 37,5°C, dor intensa) que a fizeram procurar atendimento médico depois que foi para casa?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_1
-
-# Funções para as perguntas
-async def pergunta_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_1'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "2. Sua ferida operatória apresentou sangramento persistente?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_2
-
-async def pergunta_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_2'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "3. Há algum edema (inchaço) no local da cirurgia?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_3
-
-async def pergunta_3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_3'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "4. Você apresenta dor ou edema (inchaço) nas pernas?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_4
-
-async def pergunta_4(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_4'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "5. Sente falta de ar ou cansaço aos mínimos esforços?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_5
-
-async def pergunta_5(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_5'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "6. Sente náusea (enjoo) ou apresentou vômito (provocou) depois que foi pra casa?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_6
-
-async def pergunta_6(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_6'] = update.message.text.upper()
-    
+    # Teclado apenas com opções numéricas
     keyboard = [
-        [KeyboardButton("Nenhuma vez"), KeyboardButton("1 ou 2 vezes")],
-        [KeyboardButton("Dia sim, dia não"), KeyboardButton("Defeco todos os dias")]
+        [KeyboardButton("1 - Febre"), KeyboardButton("2 - Calafrio")],
+        [KeyboardButton("3 - Dor no corpo"), KeyboardButton("4 - Nenhum sintoma")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     
     await update.message.reply_text(
-        "7. Desde que chegou em casa, você tem defecado 💩? Quantas vezes? Escolha uma das opções:",
-        reply_markup=reply_markup
+        "Vamos às perguntas!\n\n"
+        "A. Você sente 1 ou mais desses sintomas abaixo? "
+        "📝 *Você pode escolher os números OU descrever com suas palavras*\n\n"
+        "1. Febre (temperatura ≥ 37,5°C)\n"
+        "2. Calafrio (tremedeira)\n"
+        "3. Dor no corpo\n"
+        "4. Nenhum dos sintomas\n\n"
+        "💡 *Dica: Pode digitar como preferir! Ex: \"estou com febre\" ou \"1\"*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
-    return PERGUNTA_7
+    return PERGUNTA_A
 
-async def pergunta_7(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_7'] = update.message.text
+#Função da pergunta A com spaCy
+async def pergunta_a(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    resposta = update.message.text
+    texto_original = resposta  # Guardar texto original
     
-    keyboard = [
-        [KeyboardButton("Não, está com aparência normal"), KeyboardButton("Um pouco (Vermelho claro)")],
-        [KeyboardButton("Sim, bastante vermelho"), KeyboardButton("Está roxo")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    #Processar com spaCy
+    sintomas_identificados = None
     
-    await update.message.reply_text(
-        "8. Você percebeu vermelhidão (cor vermelha) ao redor dos pontos cirúrgicos? Escolha uma das opções:",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_8
-
-async def pergunta_8(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_8'] = update.message.text
+    # Se for número ou opção do botão, processa
+    if resposta in ['1', '2', '3', '4', '1 - Febre', '2 - Calafrio', '3 - Dor no corpo', '4 - Nenhum sintoma']:
+        # Extrai apenas o número se veio do botão
+        if ' - ' in resposta:
+            resposta_final = resposta.split(' - ')[0]
+        else:
+            resposta_final = resposta
+    # Se for texto, processa com spaCy
+    else:
+        sintomas_identificados = identificar_sintomas(resposta)
+        
+        if sintomas_identificados:
+            if len(sintomas_identificados) == 1:
+                resposta_final = sintomas_identificados[0]
+            else:
+                resposta_final = ','.join(sintomas_identificados)
+            
+            # Feedback do que foi entendido
+            await update.message.reply_text(
+                f"✅ Entendi! Você mencionou: {', '.join(sintomas_identificados)}"
+            )
+        else:
+            # Se não entendeu, pede para tentar novamente
+            await update.message.reply_text(
+                "🤔 Não consegui identificar os sintomas. "
+                "Pode descrever melhor ou usar os números (1, 2, 3, 4)?\n\n"
+                "Exemplos:\n"
+                "• \"estou com febre\"\n" 
+                "• \"calafrios e dor\"\n"
+                "• \"não sinto nada\""
+            )
+            return PERGUNTA_A
     
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    context.user_data['paciente'].respostas['pergunta_a'] = resposta_final
+    context.user_data['texto_original_a'] = texto_original  # Guardar original
     
-    await update.message.reply_text(
-        "9. Você sentiu a pele ao redor dos pontos cirúrgicos mais quente que o normal?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_9
-
-async def pergunta_9(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_9'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "10. Você notou se está saindo líquido ou secreção dos pontos?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_10
-
-async def pergunta_10(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    resposta = update.message.text.upper()
-    context.user_data['paciente'].respostas['pergunta_10'] = resposta
-    
-    if resposta == "SIM":
+    # Se resposta for "4" (nenhum sintoma), pula para pergunta C
+    if resposta_final == "4":
+        context.user_data['paciente'].respostas['pergunta_b'] = "NÃO SE APLICA"
+        
         keyboard = [
-            [KeyboardButton("Transparente (líquido claro)"), KeyboardButton("Purulenta (amarela ou verde)")],
-            [KeyboardButton("Sanguinolenta (líquido com aspecto de sangue)"), KeyboardButton("De cor amarronzada (marrom)")]
+            [KeyboardButton("1 - Sangramento"), KeyboardButton("2 - Secreção")],
+            [KeyboardButton("3 - Vermelhidão"), KeyboardButton("4 - Calor local")],
+            [KeyboardButton("5 - Pontos abertos"), KeyboardButton("6 - Mal cheiro")],
+            [KeyboardButton("7 - Nenhum sinal")]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
         
         await update.message.reply_text(
-            "11. Qual a cor do líquido que está saindo dos pontos cirúrgicos?",
-            reply_markup=reply_markup
+            "C. Por favor, nos responda: você percebe alguns desses sinais no local da sua cesariana? "
+            "📝 *Você pode escolher os números OU descrever com suas palavras*\n\n"
+            "1. Sangramento\n"
+            "2. Líquido amarelo, esverdeado ou marrom\n"
+            "3. Vermelhidão\n"
+            "4. Local dos pontos está quente\n"
+            "5. Abriu 1 ou mais pontos\n"
+            "6. Mal cheiro\n"
+            "7. Nenhum desses sinais\n\n"
+            "💡 *Dica: Pode digitar como preferir! Ex: \"está vermelho\" ou \"3\"*",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
         )
-        return PERGUNTA_11
+        return PERGUNTA_C
     else:
-        context.user_data['paciente'].respostas['pergunta_11'] = "NÃO SE APLICA"
-        
-        keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
+        # Se respondeu 1, 2 ou 3, vai para pergunta B
+        keyboard = [
+            [KeyboardButton("1 - Desde a alta"), KeyboardButton("2 - 1-2 dias")],
+            [KeyboardButton("3 - 3+ dias")]
+        ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
         
         await update.message.reply_text(
-            "12. A ferida operatória abriu? 1 ou mais pontos soltaram (arrebentaram)?",
+            "B. Dando continuidade, nos responda: Há quanto tempo sente esses sintomas?\n\n"
+            "1. Desde que saí do hospital\n"
+            "2. 1 ou 2 dias\n"
+            "3. 3 dias ou mais dias\n\n"
+            "Resposta:",
             reply_markup=reply_markup
         )
-        return PERGUNTA_12
+        return PERGUNTA_B
 
-async def pergunta_11(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_11'] = update.message.text
+async def pergunta_b(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    resposta = update.message.text
     
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
+    # Processar possíveis respostas em texto
+    if resposta in ['1', '2', '3', '1 - Desde a alta', '2 - 1-2 dias', '3 - 3+ dias']:
+        # Extrai apenas o número se veio do botão
+        if ' - ' in resposta:
+            resposta_final = resposta.split(' - ')[0]
+        else:
+            resposta_final = resposta
+    else:
+        texto = resposta.lower()
+        if any(palavra in texto for palavra in ['desde', 'alta', 'hospital']):
+            resposta_final = '1'
+        elif any(palavra in texto for palavra in ['1', 'um', 'dois', '2', 'poucos']):
+            resposta_final = '2'
+        elif any(palavra in texto for palavra in ['3', 'três', 'mais', 'vários']):
+            resposta_final = '3'
+        else:
+            resposta_final = resposta  # Guarda o texto original
+    
+    context.user_data['paciente'].respostas['pergunta_b'] = resposta_final
+    
+    keyboard = [
+        [KeyboardButton("1 - Sangramento"), KeyboardButton("2 - Secreção")],
+        [KeyboardButton("3 - Vermelhidão"), KeyboardButton("4 - Calor local")],
+        [KeyboardButton("5 - Pontos abertos"), KeyboardButton("6 - Mal cheiro")],
+        [KeyboardButton("7 - Nenhum sinal")]
+    ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     
     await update.message.reply_text(
-        "12. A ferida operatória abriu? 1 ou mais pontos soltaram (arrebentaram)?",
-        reply_markup=reply_markup
+        "C. Por favor, nos responda: você percebe alguns desses sinais no local da sua cesariana? "
+        "📝 *Você pode escolher os números OU descrever com suas palavras*\n\n"
+        "1. Sangramento\n"
+        "2. Líquido amarelo, esverdeado ou marrom\n"
+        "3. Vermelhidão\n"
+        "4. Local dos pontos está quente\n"
+        "5. Abriu 1 ou mais pontos\n"
+        "6. Mal cheiro\n"
+        "7. Nenhum desses sinais\n\n"
+        "💡 *Dica: Pode digitar como preferir! Ex: \"está vermelho\" ou \"3\"*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
-    return PERGUNTA_12
+    return PERGUNTA_C
 
-async def pergunta_12(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_12'] = update.message.text.upper()
+#Função da pergunta C com spaCy
+async def pergunta_c(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    resposta = update.message.text
+    texto_original = resposta  # Guardar texto original
     
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    #Processar com spaCy
+    sinais_identificados = None
     
-    await update.message.reply_text(
-        "13. Você percebeu mal cheiro no local da ferida operatória?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_13
-
-async def pergunta_13(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_13'] = update.message.text.upper()
+    # Se for número ou opção do botão, processa
+    if resposta in ['1', '2', '3', '4', '5', '6', '7', 
+                   '1 - Sangramento', '2 - Secreção', '3 - Vermelhidão',
+                   '4 - Calor local', '5 - Pontos abertos', '6 - Mal cheiro', 
+                   '7 - Nenhum sinal']:
+        # Extrai apenas o número se veio do botão
+        if ' - ' in resposta:
+            resposta_final = resposta.split(' - ')[0]
+        else:
+            resposta_final = resposta
+    # Se for texto, processa com spaCy
+    else:
+        sinais_identificados = identificar_sinais_cesariana(resposta)
+        
+        if sinais_identificados:
+            if len(sinais_identificados) == 1:
+                resposta_final = sinais_identificados[0]
+            else:
+                resposta_final = ','.join(sinais_identificados)
+            
+            # Feedback do que foi entendido
+            await update.message.reply_text(
+                f"✅ Entendi! Você mencionou: {', '.join(sinais_identificados)}"
+            )
+        else:
+            # Se não entendeu, usa texto original
+            resposta_final = resposta
+            await update.message.reply_text(
+                "⚠️ Registrei sua descrição. Vamos analisar suas respostas."
+            )
     
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "14. Você foi para a consulta de resguardo com a enfermeira ou o médico do pré-natal?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_14
-
-async def pergunta_14(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_14'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "15. Fez exames depois da alta hospitalar?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_15
-
-async def pergunta_15(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_15'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "16. Necessitou ser internada novamente na maternidade?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_16
-
-async def pergunta_16(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_16'] = update.message.text.upper()
-    
-    keyboard = [[KeyboardButton("SIM"), KeyboardButton("NÃO")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "17. Você saiu do hospital com dúvidas ou tem dúvidas quanto aos cuidados com a ferida operatória?",
-        reply_markup=reply_markup
-    )
-    return PERGUNTA_17
-
-async def pergunta_17(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['paciente'].respostas['pergunta_17'] = update.message.text.upper()
+    context.user_data['paciente'].respostas['pergunta_c'] = resposta_final
+    context.user_data['texto_original_c'] = texto_original  # Guardar original
     
     # Análise dos resultados
-    recomendacao = analisar_respostas(context.user_data['paciente'])
+    recomendacao, alerta_risco = analisar_respostas(context.user_data['paciente'])
     
     # Salva os dados no CSV
     sucesso = salvar_no_csv(
         context.user_data['paciente'],
         context.user_data['paciente'].telegram_user_id,
-        recomendacao
+        recomendacao,
+        alerta_risco,
+        context.user_data.get('texto_original_a', ''),
+        context.user_data.get('texto_original_c', '')
     )
     
-    if sucesso:
-        await update.message.reply_text(
-            f"Pronto! Terminamos.\n\n{recomendacao}\n\n"
-            "Agora, caso preferir, você pode anexar exames ou uma foto da sua ferida operatória.\n"
-            "Muito obrigada por sua participação!",
-            reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
-        )
-    else:
-        await update.message.reply_text(
-            f"Pronto! Terminamos.\n\n{recomendacao}\n\n"
-            "Agora, caso preferir, você pode anexar exames ou uma foto da sua ferida operatória.\n"
-            "Muito obrigada por sua participação!\n\n"
-            "⚠️ Observação: Houve um problema técnico ao salvar seus dados. Por favor, entre em contato com a maternidade.",
-            reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
-        )
+    mensagem_final = f"Pronto, terminamos! Muito obrigado por sua participação.\n\n{recomendacao}"
+    
+    if not sucesso:
+        mensagem_final += "\n\n⚠️ Observação: Houve um problema técnico ao salvar seus dados."
+    
+    #Remove o teclado ao final
+    await update.message.reply_text(
+        mensagem_final,
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode='Markdown'
+    )
     
     # Log dos dados
-    logging.info(f"Paciente: {context.user_data['paciente'].nome}")
+    logging.info(f"Paciente: {context.user_data['paciente'].iniciais}")
     logging.info(f"Data parto: {context.user_data['paciente'].data_parto}")
     logging.info(f"Respostas: {context.user_data['paciente'].respostas}")
     logging.info(f"Recomendação: {recomendacao}")
+    logging.info(f"Alerta Risco: {alerta_risco}")
+    
+    # Limpa os dados da conversa
+    context.user_data.clear()
     
     return ConversationHandler.END
 
 def analisar_respostas(paciente):
     respostas = paciente.respostas
     
-    # Critérios para forte suspeita de ISC (Infecção do Sítio Cirúrgico)
-    criterios_isc = [
-        respostas.get('pergunta_1') == 'SIM',  # Sintomas sistêmicos
-        respostas.get('pergunta_2') == 'SIM',  # Sangramento persistente
-        respostas.get('pergunta_8') in ['Sim, bastante vermelho', 'Está roxo'],  # Vermelhidão intensa
-        respostas.get('pergunta_9') == 'SIM',  # Calor local
-        respostas.get('pergunta_11') in ['Purulenta (amarela ou verde)', 'Sanguinolenta (líquido com aspecto de sangue)'],  # Secreção purulenta
-        respostas.get('pergunta_12') == 'SIM',  # Ferida aberta
-        respostas.get('pergunta_13') == 'SIM',  # Mal cheiro
-    ]
+    # Contar sinais e sintomas
+    sinais_sintomas_count = 0
     
-    # Critério para consulta puerperal
-    fez_consulta = respostas.get('pergunta_14') == 'SIM'
+    # Verificar sintomas (Pergunta A)
+    pergunta_a = respostas.get('pergunta_a', '')
+    if pergunta_a and pergunta_a != '4':  # Se não for "nenhum sintoma"
+        sinais_sintomas_count += len(pergunta_a.split(',')) if ',' in pergunta_a else 1
     
-    # Se houver qualquer critério de ISC positivo
-    if any(criterios_isc):
-        return "Baseado em suas informações, recomendamos que retorne com urgência, à maternidade onde você pariu ou à mais próxima de sua residência."
+    # Verificar sinais locais (Pergunta C)
+    pergunta_c = respostas.get('pergunta_c', '')
+    if pergunta_c and pergunta_c != '7':  # Se não for "nenhum sinal"
+        sinais_sintomas_count += len(pergunta_c.split(',')) if ',' in pergunta_c else 1
     
-    # Se não há ISC mas não fez consulta puerperal
-    elif not fez_consulta:
-        return "Baseado em suas informações, recomendamos que retorne à unidade de saúde onde fez seu pré-natal para consulta do puerpério ou resguardo com sua médica ou enfermeiro."
+    # CENÁRIO 1: 2 ou mais sinais/sintomas -> ALERTA VERMELHO
+    if sinais_sintomas_count >= 2:
+        recomendacao = "🚨 Baseado em suas respostas recomendamos que você retorne com urgência à maternidade onde fez sua cesariana para que seja avaliada por uma profissional de saúde."
+        alerta_risco = "VERMELHO"
     
-    # Se está internada (pergunta 16)
-    elif respostas.get('pergunta_16') == 'SIM':
-        return "Baseado em suas informações, verificamos que você já tem o acompanhamento de saúde necessário e desejamos uma ótima recuperação. Não esqueça de retornar à consulta na unidade de saúde onde fez o pré-natal."
-    
-    # Caso ideal: sem ISC e já fez consulta
+    # CENÁRIO 2: Nenhum sinal/sintoma -> Consulta de rotina
     else:
-        return "Baseado em suas informações, verificamos que você já tem o acompanhamento de saúde necessário e segue com ótima recuperação."
+        recomendacao = "Baseado em suas respostas, recomendamos que retorne à unidade de saúde onde fez seu pré-natal para consulta do puerpério ou resguardo com sua médica ou enfermeiro."
+        alerta_risco = "BAIXO"
+    
+    return recomendacao, alerta_risco
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Conversa interrompida. Se precisar reiniciar, use /start.",
-        reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
+        "Conversa interrompida. Se precisar reiniciar, envie qualquer mensagem ou use /start.",
+        reply_markup=ReplyKeyboardRemove()
     )
+    context.user_data.clear()
     return ConversationHandler.END
 
 def main():
     # Inicializa o arquivo CSV
     inicializar_csv()
     
-    # Token do bot 
+    # Verificar se spaCy está disponível
+    if not SPACY_AVAILABLE:
+        print("AVISO: spaCy não está disponível. Usando sistema de fallback.")
+        print("Para melhor experiência, instale: pip install spacy && python -m spacy download pt_core_news_sm")
+    
+    # Token do bot
     TOKEN = "8441175313:AAF3UlhGCijQwZR09aQNFuN372DMPIL4Hgs"
     
     application = Application.builder().token(TOKEN).build()
 
-    # Conversation handler
+    #Conversation handler com entrada para QUALQUER mensagem
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+        entry_points=[
+            CommandHandler('start', start),  # Mantém o comando /start
+            MessageHandler(filters.TEXT & ~filters.COMMAND, iniciar_conversa)  # 🔥 NOVO: Qualquer mensagem inicia
+        ],
         states={
             ACEITAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, aceitar_conversa)],
-            NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, obter_nome)],
+            INICIAIS: [MessageHandler(filters.TEXT & ~filters.COMMAND, obter_iniciais)],
+            DATA_NASCIMENTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, obter_data_nascimento)],
             DATA_PARTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, obter_data_parto)],
-            PERGUNTA_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_1)],
-            PERGUNTA_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_2)],
-            PERGUNTA_3: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_3)],
-            PERGUNTA_4: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_4)],
-            PERGUNTA_5: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_5)],
-            PERGUNTA_6: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_6)],
-            PERGUNTA_7: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_7)],
-            PERGUNTA_8: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_8)],
-            PERGUNTA_9: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_9)],
-            PERGUNTA_10: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_10)],
-            PERGUNTA_11: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_11)],
-            PERGUNTA_12: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_12)],
-            PERGUNTA_13: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_13)],
-            PERGUNTA_14: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_14)],
-            PERGUNTA_15: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_15)],
-            PERGUNTA_16: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_16)],
-            PERGUNTA_17: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_17)],
+            PERGUNTA_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_a)],
+            PERGUNTA_B: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_b)],
+            PERGUNTA_C: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_c)],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
     application.add_handler(conv_handler)
 
-    print("Bot de monitoramento pós-cesárea está rodando...")
+    print("Bot de monitoramento pós-cesárea COM spaCy está rodando...")
     print(f"Os dados serão salvos no arquivo: {CSV_FILENAME}")
+    print("Agora o bot inicia com QUALQUER mensagem ou com /start")
+    if SPACY_AVAILABLE:
+        print("spaCy ativo - Chatbot entendendo linguagem natural!")
+    else:
+        print("spaCy inativo - Usando sistema básico")
     application.run_polling()
 
 if __name__ == '__main__':
