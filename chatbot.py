@@ -1,693 +1,979 @@
-import logging
-import csv
 import os
 import re
-from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters, 
-    ContextTypes, ConversationHandler
+import json
+import unicodedata
+import requests
+from fastapi import FastAPI, Request
+
+# ══════════════════════════════════════════════════════════════
+# CONFIGURAÇÃO
+# ══════════════════════════════════════════════════════════════
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8876715116:AAHovOjaM9Bri0CwPCBWAGrRvpg2eiVTW0Y")
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+LM_STUDIO_URL = os.environ.get("LM_STUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
+
+SINTOMAS_VALIDOS = {"S1", "S2", "S3", "S_GEN"}
+SINAIS_VALIDOS   = {"C1", "C2", "C3", "C4", "C5", "C6"}
+SINAIS_GRAVES    = {"C1", "C5", "C6"}
+
+PARTES_CORPO_FORA_PATTERNS = [
+    r"\bjoelho\b", r"\bjoelhos\b", r"\bdente\b", r"\bdentes\b",
+    r"\bouvido\b", r"\bpe\b", r"\bpes\b", r"\bbraco\b", r"\bbracos\b",
+    r"\bmao\b", r"\bmaos\b", r"\bdedo\b", r"\bdedos\b",
+    r"\bombro\b", r"\bombros\b", r"\bcotovelo\b", r"\bcotovelos\b",
+    r"\bpunho\b", r"\bpunhos\b", r"\btornozelo\b", r"\btornozelos\b",
+    r"\bcoxa\b", r"\bcoxas\b", r"\bpanturrilha\b", r"\bboca\b",
+    r"\blingua\b", r"\bunha\b", r"\bunhas\b", r"\bcabelo\b",
+    r"\bcabelos\b",
+]
+
+# Padrões de sintomas genéricos pós-cesárea (não mapeados em S1-S3)
+SINTOMAS_GENERICOS_PATTERNS = [
+    r"\btontura\b", r"\btonto\b", r"\btonteira\b", r"\bvertigem\b",
+    r"\bnausea\b", r"\benjoo\b", r"\benjoada\b", r"\benjoado\b",
+    r"\bvomito\b", r"\bvomitando\b", r"\bvomitei\b", r"\bvomitou\b",
+    r"\bfalta de ar\b", r"\bdispneia\b",
+    r"\bcansaco\b", r"\bcansada\b", r"\bcansado\b", r"\bfadiga\b",
+    r"\bfraqueza\b", r"\bfraca\b", r"\bfraco\b",
+    r"\bpalpitacao\b", r"\bcoracao acelerado\b",
+    r"\bdesmaio\b", r"\bdesmaiei\b",
+]
+
+CONTEXTO_CESAREA = [
+    "cesarea", "cesariana", "ferida", "ponto", "curativo", "cicatriz",
+    "barriga", "abdome", "abdomen", "incisao", "operacao", "cirurgia",
+]
+
+OBSERVACAO_OFF_TOPIC = (
+    "\n\n⚠️ Observação: o que você mencionou por último não está relacionado "
+    "à cesárea, então não foi considerado na avaliação pós-operatória. Se "
+    "esse sintoma persistir ou te incomodar, procure um profissional de "
+    "saúde para avaliar."
 )
 
-#Importar spaCy
-try:
-    import spacy
-    # Carregar modelo em português
-    nlp = spacy.load("pt_core_news_sm")
-    SPACY_AVAILABLE = True
-    print(" spaCy carregado com sucesso!")
-except ImportError:
-    print(" spaCy não instalado. Use: pip install spacy")
-    print(" E depois: python -m spacy download pt_core_news_sm")
-    SPACY_AVAILABLE = False
-except OSError:
-    print("Modelo pt_core_news_sm não encontrado.")
-    print(" Execute: python -m spacy download pt_core_news_sm")
-    SPACY_AVAILABLE = False
 
-# Configuração do logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+class Etapa:
+    INICIO         = "INICIO"
+    CONSENTIMENTO  = "CONSENTIMENTO"
+    SINTOMAS       = "SINTOMAS"
+    DIAS           = "DIAS"
+    SINAIS         = "SINAIS"
+    EXTRAS         = "EXTRAS"
+    EXTRAS_DETALHE = "EXTRAS_DETALHE"
+    ENCERRADO      = "ENCERRADO"
+
+
+MENSAGENS = {
+    Etapa.CONSENTIMENTO: (
+        "Olá! Sou o Bot Cuidar, assistente virtual de acompanhamento "
+        "pós-operatório de cesárea. Posso fazer algumas perguntas sobre "
+        "como você está se sentindo? (responda sim ou não)"
+    ),
+    Etapa.SINTOMAS: (
+        "Você está sentindo algum destes sintomas? "
+        "Febre, calafrio ou dor no corpo."
+    ),
+    Etapa.DIAS: "Há quantos dias você está sentindo isso?",
+    Etapa.SINAIS: (
+        "Agora sobre o local da cesárea: você notou algum destes sinais? "
+        "Sangramento, secreção (líquido amarelo, esverdeado ou marrom), "
+        "vermelhidão, calor no local, ponto aberto ou mal cheiro."
+    ),
+    Etapa.EXTRAS: "Obrigada pelas informações! Você está sentindo mais alguma coisa?",
+    Etapa.EXTRAS_DETALHE: "O que você está sentindo?",
+}
+
+MENSAGENS_REPETICAO = {
+    Etapa.CONSENTIMENTO: (
+        "Sem problemas! Vou explicar de outra forma: eu sou o Bot Cuidar, "
+        "um assistente que ajuda no acompanhamento da recuperação após "
+        "cesárea. Posso fazer algumas perguntas? (responda sim ou não)"
+    ),
+    Etapa.SINTOMAS: (
+        "Vou repetir com mais detalhes: você está sentindo algum destes "
+        "sintomas?\n\n"
+        "• Febre (temperatura ≥ 37,5°C)\n"
+        "• Calafrio (tremedeira)\n"
+        "• Dor no corpo (dores musculares)\n\n"
+        "Se não sente nenhum, é só responder 'não'."
+    ),
+    Etapa.DIAS: (
+        "Vou reformular: há quanto tempo você sente isso? "
+        "(ex: '1 dia', '2 dias', 'ontem', 'hoje')"
+    ),
+    Etapa.SINAIS: (
+        "Vou repetir com mais detalhes: você notou algum destes sinais?\n\n"
+        "• Sangramento\n"
+        "• Secreção (líquido amarelo, esverdeado ou marrom)\n"
+        "• Vermelhidão\n"
+        "• Calor no local\n"
+        "• Ponto aberto\n"
+        "• Mal cheiro\n\n"
+        "Se não notou nenhum, é só responder 'não'."
+    ),
+    Etapa.EXTRAS: (
+        "Vou reformular: além do que você já contou, tem mais alguma "
+        "coisa incomodando? (responda sim ou não)"
+    ),
+    Etapa.EXTRAS_DETALHE: (
+        "Pode descrever melhor? Por exemplo: 'sinto calafrio' ou "
+        "'a ferida está vermelha'."
+    ),
+}
+
+MENSAGEM_CEFALEIA_COSTAS = (
+    "Entendi. Dor de cabeça ou nas costas no pós-cesárea merece "
+    "atenção — pode estar relacionada à febre ou a outras condições "
+    "que precisam de avaliação.\n\n"
+    "Para eu te orientar melhor, você está sentindo algum destes "
+    "sintomas?\n\n"
+    "• Febre (temperatura ≥ 37,5°C)\n"
+    "• Calafrio (tremedeira)\n"
+    "• Dor no corpo (dores musculares)\n\n"
+    "Se não sente nenhum, é só responder 'não'."
 )
 
-# Estados da conversação
-ACEITAR, INICIAIS, DATA_NASCIMENTO, DATA_PARTO, PERGUNTA_A, PERGUNTA_B, PERGUNTA_C = range(7)
-
-# Nome do arquivo CSV
-CSV_FILENAME = "dados_pacientes.csv"
-
-#Dicionários de sinônimos e mapeamento para o spaCy
-MApeamento_SINTOMAS = {
-    'febre': ['febre', 'calor', 'temperatura', 'quente', 'aquecida', 'febril', '37.5', '38'],
-    'calafrio': ['calafrio', 'tremedeira', 'tremor', 'calafrios', 'tremendo'],
-    'dor_corpo': ['dor', 'dores', 'corpo dolorido', 'dói', 'dor no corpo', 'dores no corpo'],
-    'nenhum_sintoma': ['nenhum', 'nada', 'tudo bem', 'estou bem', 'não sinto nada']
+MENSAGENS_FORA_ESCOPO = {
+    Etapa.SINTOMAS: (
+        "Entendi, mas essa informação não está relacionada à recuperação "
+        "da cesárea. Vou repetir focando na sua recuperação:\n\n"
+        "Você está sentindo febre, calafrio ou dor no corpo "
+        "(dores musculares generalizadas)?\n\n"
+        "Se não sente nenhum, é só responder 'não'."
+    ),
+    Etapa.SINAIS: (
+        "Entendi, mas essa informação não está relacionada ao local da "
+        "cesárea. Vou repetir focando no local da cirurgia:\n\n"
+        "Você notou, na ferida da cesárea (barriga/abdômen), algum destes "
+        "sinais?\n\n"
+        "• Sangramento\n• Secreção\n• Vermelhidão\n• Calor no local\n"
+        "• Ponto aberto\n• Mal cheiro\n\n"
+        "Se não notou nenhum, é só responder 'não'."
+    ),
 }
 
-Mapeamento_SINAIS = {
-    'sangramento': ['sangramento', 'sangrando', 'sangra', 'sangue'],
-    'secrecao': ['líquido amarelo', 'líquido esverdeado', 'líquido marrom', 'secreção', 'pus', 'corrimento', 'amarelo', 'verde', 'marrom'],
-    'vermelhidao': ['vermelhidão', 'vermelho', 'avermelhado', 'inchado', 'inflamado'],
-    'calor_local': ['quente', 'calor', 'aquecido', 'ardendo'],
-    'pontos_abertos': ['abriu', 'pontos abertos', 'pontos soltos', 'arrebentou', 'rompeu'],
-    'mal_cheiro': ['mal cheiro', 'fedendo', 'fedor', 'cheiro ruim'],
-    'nenhum_sinal': ['nenhum', 'nada', 'tudo normal', 'está bom']
+MENSAGENS_ENCERRAMENTO = {
+    "BAIXO": "Obrigada por compartilhar! Seus relatos não indicam sinais de alerta no momento. Continue seguindo as orientações da equipe que acompanha sua recuperação e mantenha os cuidados com a ferida. Se algo mudar, procure atendimento. Cuide-se bem!",
+    "MEDIO": "Obrigada pelas informações! Alguns dos sinais/sintomas que você relatou merecem atenção. Recomendo entrar em contato com sua equipe médica ou de enfermagem nas próximas 24 horas para uma avaliação. Se piorar, procure atendimento imediatamente. Cuide-se bem!",
+    "ALTO": "Obrigada por compartilhar! Os sintomas e sinais que você relatou indicam necessidade de avaliação médica o quanto antes. Por favor, procure sua equipe de saúde ou um pronto atendimento AGORA. Se houver sangramento intenso, febre alta persistente, falta de ar ou desmaio, chame ajuda imediatamente. Cuide-se bem!",
+    "INDEFINIDO": "Obrigada pelo relato! Não consegui identificar com clareza o que você está sentindo. Por segurança, recomendo conversar com sua equipe médica ou de enfermagem. Cuide-se bem!"
 }
 
-# Dados do paciente
-class Paciente:
-    def __init__(self):
-        self.iniciais = ""
-        self.data_nascimento = ""
-        self.data_parto = ""
-        self.respostas = {}
-        self.data_preenchimento = ""
-        self.telegram_user_id = ""
 
-#Função para iniciar com QUALQUER mensagem
-async def iniciar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia a conversa quando o usuário envia QUALQUER mensagem"""
-    
-    # Verifica se já existe uma conversa em andamento
-    if 'paciente' in context.user_data:
-        # Se já existe uma conversa, não reinicia
-        return await handle_mensagem_qualquer(update, context)
-    
-    # Inicia nova conversa
-    context.user_data['paciente'] = Paciente()
-    context.user_data['paciente'].telegram_user_id = update.effective_user.id
-    context.user_data['paciente'].data_preenchimento = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-    
-    keyboard = [
-        [KeyboardButton("SIM"), KeyboardButton("NÃO")]
+# ══════════════════════════════════════════════════════════════
+# AUXILIARES
+# ══════════════════════════════════════════════════════════════
+
+def novo_estado():
+    return {
+        "etapa": Etapa.INICIO,
+        "consentimento": None,
+        "sintomas": [],
+        "dias": None,
+        "sinais": [],
+        "extras": [],
+        "extras_off_topic": [],
+        "risco": None,
+        "confusoes": 0,
+    }
+
+
+def remover_acentos(texto):
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', texto)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+
+def detecta_sintoma_generico(texto):
+    """Detecta sintomas comuns pós-cesárea fora dos códigos S1-S3."""
+    t = remover_acentos(texto.lower())
+    return any(re.search(p, t) for p in SINTOMAS_GENERICOS_PATTERNS)
+
+
+def eh_confusao(texto):
+    t = remover_acentos(texto.lower().strip())
+    frases = [
+        "nao entendi", "nao compreendi", "nao entendi nada",
+        "nao ficou claro", "como assim", "o que voce quis dizer",
+        "o que significa", "nao sei do que voce esta falando",
+        "nao sei o que responder", "nao sei responder",
+        "nao sei dizer", "me explica", "explica melhor",
+        "pode explicar", "pode repetir", "repete", "repita",
     ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "👋 Olá! Sou assistente virtual da Comissão de Controle de Vigilância Hospitalar e "
-        "gostaria de saber como você está após seu parto cesariano para garantir que "
-        "sua recuperação esteja indo bem. Serão apenas 5 minutos, onde faremos 3 perguntas "
-        "com alternativas de resposta.\n\n"
-        "Você aceita seguir com a conversa nesse momento?",
-        reply_markup=reply_markup
-    )
-    return ACEITAR
-
-async def handle_mensagem_qualquer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lida com mensagens enviadas durante conversas em andamento"""
-    await update.message.reply_text(
-        "🤔 Você já tem uma conversa em andamento. "
-        "Se quiser recomeçar, use /start para iniciar uma nova conversa.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    return ConversationHandler.END
-
-#Função start tradicional para quem preferir usar o comando
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Função start tradicional - opcional"""
-    context.user_data['paciente'] = Paciente()
-    context.user_data['paciente'].telegram_user_id = update.effective_user.id
-    context.user_data['paciente'].data_preenchimento = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-    
-    keyboard = [
-        [KeyboardButton("SIM"), KeyboardButton("NÃO")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "👋 Olá! Sou assistente virtual da Comissão de Controle de Vigilância Hospitalar e "
-        "gostaria de saber como você está após seu parto cesariano para garantir que "
-        "sua recuperação esteja indo bem. Serão apenas 5 minutos, onde faremos 3 perguntas "
-        "com alternativas de resposta.\n\n"
-        "Você aceita seguir com a conversa nesse momento?",
-        reply_markup=reply_markup
-    )
-    return ACEITAR
-
-#Funções de Processamento de Linguagem Natural com spaCy
-def processar_texto_spacy(texto):
-    """Processa texto usando spaCy para extrair informações relevantes"""
-    if not SPACY_AVAILABLE:
-        return processar_texto_simples(texto)
-    
-    doc = nlp(texto.lower())
-    
-    # Extrair tokens relevantes (remover stop words)
-    tokens_relevantes = []
-    for token in doc:
-        if not token.is_stop and not token.is_punct and token.is_alpha:
-            tokens_relevantes.append(token.lemma_)
-    
-    return tokens_relevantes
-
-def identificar_sintomas(texto):
-    """Identifica sintomas no texto usando spaCy"""
-    tokens = processar_texto_spacy(texto)
-    
-    sintomas_identificados = []
-    
-    for token in tokens:
-        for sintoma, sinônimos in MApeamento_SINTOMAS.items():
-            if any(sinônimo in token for sinônimo in sinônimos):
-                if sintoma not in sintomas_identificados and sintoma != 'nenhum_sintoma':
-                    sintomas_identificados.append(sintoma)
-    
-    # Verificar se mencionou "nenhum sintoma"
-    texto_limpo = texto.lower()
-    for palavra in MApeamento_SINTOMAS['nenhum_sintoma']:
-        if palavra in texto_limpo:
-            return ['4']  # Retorna código para "nenhum sintoma"
-    
-    # Mapear para códigos numéricos
-    codigos = []
-    for sintoma in sintomas_identificados:
-        if sintoma == 'febre':
-            codigos.append('1')
-        elif sintoma == 'calafrio':
-            codigos.append('2')
-        elif sintoma == 'dor_corpo':
-            codigos.append('3')
-    
-    return codigos if codigos else None
-
-def identificar_sinais_cesariana(texto):
-    """Identifica sinais na cesariana usando spaCy"""
-    tokens = processar_texto_spacy(texto)
-    
-    sinais_identificados = []
-    
-    for token in tokens:
-        for sinal, sinônimos in Mapeamento_SINAIS.items():
-            if any(sinônimo in token for sinônimo in sinônimos):
-                if sinal not in sinais_identificados and sinal != 'nenhum_sinal':
-                    sinais_identificados.append(sinal)
-    
-    # Verificar se mencionou "nenhum sinal"
-    texto_limpo = texto.lower()
-    for palavra in Mapeamento_SINAIS['nenhum_sinal']:
-        if palavra in texto_limpo:
-            return ['7']  # Retorna código para "nenhum sinal"
-    
-    # Mapear para códigos numéricos
-    codigos = []
-    for sinal in sinais_identificados:
-        if sinal == 'sangramento':
-            codigos.append('1')
-        elif sinal == 'secrecao':
-            codigos.append('2')
-        elif sinal == 'vermelhidao':
-            codigos.append('3')
-        elif sinal == 'calor_local':
-            codigos.append('4')
-        elif sinal == 'pontos_abertos':
-            codigos.append('5')
-        elif sinal == 'mal_cheiro':
-            codigos.append('6')
-    
-    return codigos if codigos else None
-
-def processar_texto_simples(texto):
-    """Fallback se spaCy não estiver disponível"""
-    texto = texto.lower()
-    
-    # Verificação simples por palavras-chave
-    sintomas = []
-    if any(palavra in texto for palavra in ['febre', 'calor', 'temperatura']):
-        sintomas.append('1')
-    if any(palavra in texto for palavra in ['calafrio', 'tremedeira', 'tremor']):
-        sintomas.append('2')
-    if any(palavra in texto for palavra in ['dor', 'dores', 'dói']):
-        sintomas.append('3')
-    if any(palavra in texto for palavra in ['nenhum', 'nada', 'tudo bem']):
-        return ['4']
-    
-    return sintomas if sintomas else None
-
-# Função para inicializar o arquivo CSV com cabeçalhos
-def inicializar_csv():
-    if not os.path.exists(CSV_FILENAME):
-        with open(CSV_FILENAME, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            headers = [
-                'Data_Preenchimento', 'Telegram_User_ID', 'Iniciais_Nome', 
-                'Data_Nascimento', 'Data_Parto', 'Pergunta_A_Sintomas',
-                'Pergunta_B_Tempo_Sintomas', 'Pergunta_C_Sinais_Cesariana',
-                'Recomendacao', 'Alerta_Risco', 'Texto_Original_A', 'Texto_Original_C'
-            ]
-            writer.writerow(headers)
-
-#Função para salvar dados no CSV
-def salvar_no_csv(paciente, telegram_user_id, recomendacao, alerta_risco, texto_original_a="", texto_original_c=""):
-    try:
-        with open(CSV_FILENAME, 'a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            
-            linha = [
-                paciente.data_preenchimento,
-                telegram_user_id,
-                paciente.iniciais,
-                paciente.data_nascimento,
-                paciente.data_parto,
-                paciente.respostas.get('pergunta_a', ''),
-                paciente.respostas.get('pergunta_b', ''),
-                paciente.respostas.get('pergunta_c', ''),
-                recomendacao,
-                alerta_risco,
-                texto_original_a,
-                texto_original_c
-            ]
-            
-            writer.writerow(linha)
-        logging.info(f"Dados salvos no CSV para: {paciente.iniciais}")
+    for f in frases:
+        if f in t:
+            return True
+    if t in ["?", "??", "???", "que", "como", "oi?", "e?", "ha", "hein", "huh"]:
         return True
-    except Exception as e:
-        logging.error(f"Erro ao salvar no CSV: {e}")
+    return False
+
+
+def eh_nao_sei(texto):
+    t = remover_acentos(texto.lower().strip())
+    frases = [
+        "nao sei", "nao sei dizer", "nao tenho certeza",
+        "nao sei informar", "nao lembro", "sei la", "nao sei bem",
+        "nao sei te dizer", "nao tenho como saber", "nao faco ideia",
+        "nao tenho ideia",
+    ]
+    return any(f in t for f in frases)
+
+
+def menciona_cefaleia_ou_costas(texto):
+    t = remover_acentos(texto.lower())
+    return any(x in t for x in
+               ["cabeca", "costas", "lombar", "nuca", "migranea", "enxaqueca"])
+
+
+def eh_fora_do_escopo(texto):
+    t = remover_acentos(texto.lower())
+    if any(c in t for c in CONTEXTO_CESAREA):
         return False
+    for pattern in PARTES_CORPO_FORA_PATTERNS:
+        if re.search(pattern, t):
+            return True
+    return False
 
-# Função para validar data no formato DD/MM/AAAA
-def validar_data(data_str, tipo="nascimento"):
+
+def eh_negacao_simples(texto):
+    t = remover_acentos(texto.lower().strip())
+    t = re.sub(r'[,.!?;]', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    negacoes = {
+        "nao", "n", "nenhum", "nenhuma", "nada",
+        "nao nada", "nao nenhum", "nao nenhuma",
+        "nao obrigada", "nada nao",
+    }
+    return t in negacoes
+
+
+def quer_reiniciar(texto, etapa_atual):
+    t = remover_acentos(texto.lower().strip())
+    if t in ["/start", "/reset", "/reiniciar", "/recomecar", "/menu", "/novo"]:
+        return True
+    if etapa_atual == Etapa.ENCERRADO:
+        palavras = ["reiniciar", "recomecar", "reset", "novo", "novo teste",
+                    "de novo", "tentar de novo", "tentar novamente", "menu",
+                    "iniciar", "comecar"]
+        if t in palavras:
+            return True
+    return False
+
+
+# ══════════════════════════════════════════════════════════════
+# LLM
+# ══════════════════════════════════════════════════════════════
+
+def chamar_llm(messages, force_json=False, max_tokens=400):
+    payload = {"messages": messages, "temperature": 0, "max_tokens": max_tokens}
+    if force_json:
+        payload["response_format"] = {"type": "json_object"}
     try:
-        data = datetime.strptime(data_str, '%d/%m/%Y')
-        
-        if tipo == "nascimento":
-            if data > datetime.now():
-                return False, "Data de nascimento não pode ser no futuro."
-        elif tipo == "parto":
-            if data > datetime.now():
-                return False, "Data do parto não pode ser no futuro."
-        
-        return True, data_str
-    except ValueError:
-        return False, "Formato inválido. Use DD/MM/AAAA."
+        r = requests.post(LM_STUDIO_URL, json=payload, timeout=60)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[ERRO LLM] {e}")
+        return ""
 
-#Função para validar APENAS iniciais
-def validar_iniciais(iniciais_str):
-    iniciais_limpas = iniciais_str.strip().upper()
-    
-    if not iniciais_limpas:
-        return False, "Iniciais não podem estar vazias."
-    
-    if not re.match(r'^[A-ZÀ-ÿ]+$', iniciais_limpas.replace(' ', '')):
-        return False, "Use apenas letras para as iniciais (sem números ou caracteres especiais)."
-    
-    if len(iniciais_limpas.replace(' ', '')) > 10:
-        return False, "Por favor, digite apenas as iniciais (máximo 10 letras). Ex: PRN"
-    
-    if len(iniciais_limpas.replace(' ', '')) < 2:
-        return False, "Digite pelo menos 2 letras para as iniciais."
-    
-    return True, iniciais_limpas
 
-async def aceitar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    resposta = update.message.text.upper()
-    
-    if resposta == "NÃO":
-        await update.message.reply_text(
-            "Retorne com seu médico ou enfermeira do pré-natal para sua consulta de resguardo "
-            "e em caso de sintomas como febre, vermelhidão e secreção no local da cesariana "
-            "retorna à maternidade onde realizou o parto.",
-            reply_markup=ReplyKeyboardRemove()
+# ══════════════════════════════════════════════════════════════
+# FALLBACK POR PALAVRAS-CHAVE
+# ══════════════════════════════════════════════════════════════
+
+def _fallback_sintomas(texto):
+    t = texto.lower()
+    if any(n in t for n in ["não sinto nada", "nao sinto nada",
+                            "não tenho nada", "nao tenho nada",
+                            "nenhum sintoma", "sem sintoma"]):
+        return ["NENHUM_SINTOMA"]
+
+    codigos = []
+    tem_febre = any(x in t for x in ["febre", "temperatura", "38 graus",
+                                      "39 graus", "40 graus"])
+    neg_febre = any(x in t for x in ["não tenho febre", "nao tenho febre",
+                                      "sem febre", "não estou com febre",
+                                      "nao estou com febre", "não sinto febre",
+                                      "nao sinto febre"])
+    if tem_febre and not neg_febre:
+        codigos.append("S1")
+
+    tem_cal = any(x in t for x in ["calafrio", "tremendo", "tremedeira",
+                                    "tremor", "me tremendo"])
+    neg_cal = any(x in t for x in ["não tenho calafrio", "nao tenho calafrio",
+                                    "sem calafrio", "não estou tremendo",
+                                    "nao estou tremendo"])
+    if tem_cal and not neg_cal:
+        codigos.append("S2")
+
+    tem_dor = any(x in t for x in ["dor no corpo", "dói tudo", "doi tudo",
+                                    "corpo dolorido", "corpo doído", "mialgia",
+                                    "dores no corpo"])
+    neg_dor = any(x in t for x in ["não tenho dor", "nao tenho dor", "sem dor",
+                                    "não sinto dor", "nao sinto dor"])
+    if tem_dor and not neg_dor:
+        codigos.append("S3")
+
+    # Sintomas genéricos (tontura, náusea, falta de ar, etc.)
+    if detecta_sintoma_generico(texto):
+        codigos.append("S_GEN")
+
+    if codigos:
+        return codigos
+
+    if any(n in t for n in ["não sinto", "nao sinto", "não tenho", "nao tenho",
+                            "estou bem", "tô bem", "to bem", "tudo normal",
+                            "tudo bem", "nada disso"]):
+        return ["NENHUM_SINTOMA"]
+
+    return ["INDEFINIDO"]
+
+
+def _fallback_sinais(texto):
+    t = texto.lower()
+    if any(n in t for n in ["não noto nada", "nao noto nada", "não vi nada",
+                            "nao vi nada", "nenhum sinal", "sem sinal",
+                            "tá normal", "ta normal", "não tem nada",
+                            "nao tem nada", "está tudo normal",
+                            "esta tudo normal"]):
+        return ["NENHUM_SINAL"]
+
+    codigos = []
+
+    tem_sang = any(x in t for x in ["sangue", "sangrando", "sangramento",
+                                     "sangrou", "saiu sangue"])
+    neg_sang = any(x in t for x in ["sem sangue", "não tem sangue",
+                                     "nao tem sangue", "não está sangrando",
+                                     "nao esta sangrando", "parou de sangrar",
+                                     "não sangra", "nao sangra"])
+    if tem_sang and not neg_sang:
+        codigos.append("C1")
+
+    tem_secr = any(x in t for x in ["pus", "secre", "líquido amarelo",
+                                     "liquido amarelo", "esverdeado",
+                                     "corrimento", "saindo líquido"])
+    neg_secr = any(x in t for x in ["sem secreção", "sem secrecao",
+                                     "não tem pus", "nao tem pus",
+                                     "não tem secreção", "nao tem secrecao",
+                                     "não sai líquido"])
+    if tem_secr and not neg_secr:
+        codigos.append("C2")
+
+    tem_verm = any(x in t for x in ["vermelh", "inflamad", "inflamação",
+                                     "inflamacao", "avermelh"])
+    neg_verm = any(x in t for x in ["não está vermelho", "nao esta vermelho",
+                                     "não tem vermelhidão", "sem vermelhidão",
+                                     "sem vermelhidao", "não está inflamado",
+                                     "nao esta inflamado"])
+    if tem_verm and not neg_verm:
+        codigos.append("C3")
+
+    tem_calor = any(x in t for x in ["local quente", "ferida quente",
+                                      "tá quente", "ta quente", "calor no local",
+                                      "esquentou", "está quente", "esta quente"])
+    neg_calor = any(x in t for x in ["não está quente", "nao esta quente",
+                                      "não tem calor", "nao tem calor"])
+    if tem_calor and not neg_calor:
+        codigos.append("C4")
+
+    tem_abr = any(x in t for x in ["abriu", "aberto", "rasgou", "rompeu",
+                                    "ponto abriu", "ferida abriu"])
+    neg_abr = any(x in t for x in ["não abriu", "nao abriu",
+                                    "não está aberto", "nao esta aberto"])
+    if tem_abr and not neg_abr:
+        codigos.append("C5")
+
+    tem_cheiro = any(x in t for x in ["cheiro ruim", "mal cheiro", "mau odor",
+                                       "odor ruim", "fedor", "fede",
+                                       "cheirando mal"])
+    neg_cheiro = any(x in t for x in ["não tem cheiro", "nao tem cheiro",
+                                       "sem cheiro", "sem odor",
+                                       "não tem odor"])
+    if tem_cheiro and not neg_cheiro:
+        codigos.append("C6")
+
+    if codigos:
+        return codigos
+
+    if any(n in t for n in ["não noto", "nao noto", "não vi", "nao vi"]):
+        return ["NENHUM_SINAL"]
+
+    return ["INDEFINIDO"]
+
+
+# ══════════════════════════════════════════════════════════════
+# PARSERS
+# ══════════════════════════════════════════════════════════════
+
+def parse_consentimento(texto):
+    t = texto.lower().strip()
+    if t in ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite",
+             "e aí", "eai", "e ai", "hey", "hello"]:
+        return "SAUDACAO"
+
+    for neg in ["não", "nao", "n", "negativo", "prefiro não", "agora não",
+                "deixa", "dispenso", "não quero", "nao quero"]:
+        if t == neg or t.startswith(neg + " ") or t.startswith(neg + ","):
+            return False
+    for af in ["sim", "s", "claro", "pode", "ok", "tá bom", "ta bom",
+               "positivo", "com certeza", "manda", "bora", "vamos",
+               "aceito", "quero", "yes", "yep"]:
+        if t == af or t.startswith(af + " ") or t.startswith(af + ","):
+            return True
+
+    resp = chamar_llm([
+        {"role": "system", "content":
+            "Classifique em SIM, NAO, SAUDACAO ou CONFUSAO.\n\n"
+            "Exemplos:\n- 'sim' → SIM\n- 'claro, pode' → SIM\n"
+            "- 'tá bom' → SIM\n- 'não' → NAO\n- 'prefiro não' → NAO\n"
+            "- 'oi' → SAUDACAO\n- 'bom dia' → SAUDACAO\n"
+            "- 'não entendi' → CONFUSAO\n- 'como assim?' → CONFUSAO\n\n"
+            "Responda APENAS: SIM, NAO, SAUDACAO ou CONFUSAO."},
+        {"role": "user", "content": texto}
+    ])
+    ru = resp.upper()
+    if "CONFUSAO" in ru: return "CONFUSAO"
+    if "SAUDACAO" in ru: return "SAUDACAO"
+    if "SIM" in ru: return True
+    if "NAO" in ru or "NÃO" in ru: return False
+    return None
+
+
+def parse_sintomas(texto):
+    if eh_negacao_simples(texto):
+        print(f"[SINTOMAS] negação simples: '{texto}' → NENHUM_SINTOMA")
+        return ["NENHUM_SINTOMA"]
+
+    prompt = f"""Extraia APENAS os sintomas gerais relacionados à recuperação
+pós-cesárea mencionados pela paciente.
+
+Códigos:
+S1 = Febre (temperatura alta, "tô quente", "38 graus")
+S2 = Calafrio (tremedeira, tremendo, muito frio)
+S3 = Dor no corpo (dói tudo, corpo dolorido, dores musculares generalizadas)
+S_GEN = Outros sintomas (tontura, náusea, vômito, falta de ar, cansaço,
+        fraqueza, palpitação, desmaio)
+
+IMPORTANTE:
+- "um pouco de X", "só um pouco de X", "leve X", "X baixa" INDICAM que a paciente TEM o sintoma X.
+- Sintomas em OUTRAS partes do corpo (dor no joelho, dor de dente, 
+  dor no braço) NÃO devem ser considerados.
+- EXCEÇÃO: dor de cabeça e dor nas costas PODEM estar relacionadas ao 
+  pós-cesárea. Se acompanhadas de febre, extraia S1. Se isoladas, 
+  retorne ["INDEFINIDO"] para que o bot peça mais informações.
+- Se a paciente só relatar sintomas fora do contexto → ["INDEFINIDO"]
+
+Regras:
+- Se disser que NÃO sente nada ou está bem → ["NENHUM_SINTOMA"]
+- Se for vago/incompreensível → ["INDEFINIDO"]
+- Se listar algum sintoma geral → JSON puro com os códigos
+
+Exemplos:
+- "estou com febre e dor no corpo" → ["S1","S3"]
+- "só calafrio" → ["S2"]
+- "não sinto nada" → ["NENHUM_SINTOMA"]
+- "estou bem, obrigada" → ["NENHUM_SINTOMA"]
+- "um pouco de febre" → ["S1"]
+- "só um pouco de dor no corpo" → ["S3"]
+- "leve febre" → ["S1"]
+- "tô com uma febrinha" → ["S1"]
+- "não tenho febre" → ["NENHUM_SINTOMA"]
+- "sinto tontura" → ["S_GEN"]
+- "tô com náusea" → ["S_GEN"]
+- "estou com falta de ar" → ["S_GEN"]
+- "cansaço e fraqueza" → ["S_GEN"]
+- "tontura e febre" → ["S1","S_GEN"]
+- "dor no joelho quando me abaixo" → ["INDEFINIDO"]
+- "dor de dente" → ["INDEFINIDO"]
+- "meu braço tá doendo" → ["INDEFINIDO"]
+- "dor de cabeça e febre" → ["S1"]
+- "dor de cabeça" → ["INDEFINIDO"]
+- "dor nas costas desde a cesárea" → ["INDEFINIDO"]
+- "estou com febre e dor no joelho" → ["S1"]
+- "me sinto estranha" → ["INDEFINIDO"]
+- "não sei" → ["INDEFINIDO"]
+
+Mensagem da paciente: "{texto}"
+
+Responda APENAS o JSON."""
+    resp = chamar_llm([{"role": "user", "content": prompt}], force_json=True)
+    try:
+        codigos = json.loads(resp)
+        if not isinstance(codigos, list) or not codigos:
+            print(f"[SINTOMAS] JSON vazio → fallback")
+            return _fallback_sintomas(texto)
+        if "NENHUM_SINTOMA" in codigos:
+            fb = _fallback_sintomas(texto)
+            fb_pos = [c for c in fb if c.startswith("S") and c != "NENHUM_SINTOMA"]
+            if fb_pos:
+                print(f"[SINTOMAS] LLM disse NENHUM, mas fallback detectou {fb_pos} — usando fallback")
+                return fb_pos
+            return ["NENHUM_SINTOMA"]
+        if "INDEFINIDO" in codigos:
+            print(f"[SINTOMAS] LLM disse INDEFINIDO → fallback")
+            return _fallback_sintomas(texto)
+        validos = [c for c in codigos if c in SINTOMAS_VALIDOS]
+        if not validos:
+            print(f"[SINTOMAS] JSON sem códigos válidos → fallback")
+            return _fallback_sintomas(texto)
+        print(f"[SINTOMAS] LLM detectou: {validos}")
+        return validos
+    except json.JSONDecodeError:
+        print(f"[SINTOMAS] JSON inválido → fallback")
+        return _fallback_sintomas(texto)
+
+
+def parse_dias(texto):
+    t = texto.lower().strip()
+    m = re.search(r'\d+', t)
+    if m: return int(m.group())
+    numeros = {"um":1,"uma":1,"dois":2,"duas":2,"três":3,"tres":3,"quatro":4,
+               "cinco":5,"seis":6,"sete":7,"oito":8,"nove":9,"dez":10,
+               "ontem":1,"hoje":0,"anteontem":2}
+    for palavra, num in numeros.items():
+        if palavra in t: return num
+    return None
+
+
+def parse_sinais(texto):
+    if eh_negacao_simples(texto):
+        print(f"[SINAIS] negação simples: '{texto}' → NENHUM_SINAL")
+        return ["NENHUM_SINAL"]
+
+    prompt = f"""Extraia APENAS os sinais no LOCAL DA CESÁREA (barriga/abdômen/ferida).
+
+Códigos:
+C1 = Sangramento (sangue, sangrando)
+C2 = Secreção (pus, líquido amarelo/esverdeado/marrom)
+C3 = Vermelhidão (vermelho, inflamado)
+C4 = Calor local (local quente ao toque)
+C5 = Ponto aberto (abriu, rompeu, rasgou)
+C6 = Mal cheiro (cheiro ruim, odor, fedor)
+
+IMPORTANTE:
+- "um pouco de X", "só um pouco de X", "leve X" INDICAM que a paciente TEM o sinal X.
+- Sinais em OUTRAS partes do corpo (vermelhidão no braço, pus no pé, 
+  coceira no joelho) NÃO devem ser considerados.
+- Se a paciente só relatar sinais fora do contexto → ["INDEFINIDO"]
+
+Regras:
+- Se disser que NÃO notou nada → ["NENHUM_SINAL"]
+- Se for vago → ["INDEFINIDO"]
+- Se listar → JSON puro com os códigos
+
+Exemplos:
+- "o ponto está sangrando" → ["C1"]
+- "sai pus do curativo" → ["C2"]
+- "tá vermelho e quente" → ["C3","C4"]
+- "o ponto abriu" → ["C5"]
+- "tem cheiro ruim na ferida" → ["C6"]
+- "um pouco de pus" → ["C2"]
+- "levemente vermelho na cicatriz" → ["C3"]
+- "não noto nada" → ["NENHUM_SINAL"]
+- "tá tudo normal" → ["NENHUM_SINAL"]
+- "meu braço tá vermelho" → ["INDEFINIDO"]
+- "o pé tá com pus" → ["INDEFINIDO"]
+- "a cicatriz tá vermelha e o braço também" → ["C3"]
+- "não sei" → ["INDEFINIDO"]
+
+Mensagem da paciente: "{texto}"
+
+Responda APENAS o JSON."""
+    resp = chamar_llm([{"role": "user", "content": prompt}], force_json=True)
+    try:
+        codigos = json.loads(resp)
+        if not isinstance(codigos, list) or not codigos:
+            print(f"[SINAIS] JSON vazio → fallback")
+            return _fallback_sinais(texto)
+        if "NENHUM_SINAL" in codigos:
+            fb = _fallback_sinais(texto)
+            fb_pos = [c for c in fb if c.startswith("C")]
+            if fb_pos:
+                print(f"[SINAIS] LLM disse NENHUM, mas fallback detectou {fb_pos} — usando fallback")
+                return fb_pos
+            return ["NENHUM_SINAL"]
+        if "INDEFINIDO" in codigos:
+            print(f"[SINAIS] LLM disse INDEFINIDO → fallback")
+            return _fallback_sinais(texto)
+        validos = [c for c in codigos if c in SINAIS_VALIDOS]
+        if not validos:
+            print(f"[SINAIS] JSON sem códigos válidos → fallback")
+            return _fallback_sinais(texto)
+        print(f"[SINAIS] LLM detectou: {validos}")
+        return validos
+    except json.JSONDecodeError:
+        print(f"[SINAIS] JSON inválido → fallback")
+        return _fallback_sinais(texto)
+
+
+def parse_extras(texto):
+    t = texto.lower().strip()
+
+    if t in ["sim", "s", "positivo", "yes", "aham", "uhum"]:
+        return ("APENAS_SIM", [])
+
+    if t in ["não", "nao", "n", "negativo", "nenhum", "nada"] \
+       or t.startswith("não ") or t.startswith("nao "):
+        return ("NAO", [])
+    if eh_nao_sei(texto):
+        return ("NAO", [])
+
+    prompt = f"""A paciente foi questionada se sente MAIS alguma coisa e disse:
+"{texto}"
+
+Extraia APENAS sintomas gerais (S) e sinais no local da cesárea (C).
+
+Sintomas: S1=Febre, S2=Calafrio, S3=Dor no corpo,
+          S_GEN=Outros (tontura, náusea, vômito, falta de ar, cansaço,
+          fraqueza, palpitação, desmaio)
+Sinais: C1=Sangramento, C2=Secreção, C3=Vermelhidão,
+        C4=Calor local, C5=Ponto aberto, C6=Mal cheiro
+
+IMPORTANTE: sintomas/sinais em outras partes do corpo (joelho, dente,
+braço) NÃO devem ser considerados. Exceção: dor de cabeça com febre 
+conta como S1.
+
+Exemplos:
+- "não" → {{"itens": []}}
+- "sim, sinto calafrio e febre" → {{"itens": ["S1","S2"]}}
+- "sim, tem pus saindo do ponto" → {{"itens": ["C2"]}}
+- "tô com dor no corpo e o ponto tá vermelho" → {{"itens": ["S3","C3"]}}
+- "um pouco de febre" → {{"itens": ["S1"]}}
+- "sinto tontura" → {{"itens": ["S_GEN"]}}
+- "tô com náusea" → {{"itens": ["S_GEN"]}}
+- "falta de ar" → {{"itens": ["S_GEN"]}}
+- "cansaço e febre" → {{"itens": ["S1","S_GEN"]}}
+- "estou com dor no joelho" → {{"itens": []}}
+- "sim, dor de dente" → {{"itens": []}}
+- "meu braço tá com pus" → {{"itens": []}}
+- "sim, dor de cabeça e febre" → {{"itens": ["S1"]}}
+- "sim" → {{"itens": []}}
+
+Responda APENAS o JSON no formato {{"itens": [...]}}."""
+    resp = chamar_llm([{"role": "user", "content": prompt}], force_json=True)
+
+    itens = []
+    try:
+        dados = json.loads(resp)
+        itens = dados.get("itens", []) or []
+    except (json.JSONDecodeError, AttributeError):
+        print(f"[EXTRAS] JSON inválido → fallback")
+
+    if not itens:
+        itens = [c for c in _fallback_sintomas(texto) if c.startswith("S") and c != "NENHUM_SINTOMA"]
+        itens.extend([c for c in _fallback_sinais(texto) if c.startswith("C") and c != "NENHUM_SINAL"])
+
+    if itens:
+        print(f"[EXTRAS] detectou: {itens}")
+        return ("DETALHE", itens)
+
+    if eh_fora_do_escopo(texto):
+        print(f"[EXTRAS] OFF_TOPIC detectado: '{texto}'")
+        return ("OFF_TOPIC", [])
+
+    return ("APENAS_SIM", [])
+
+
+# ══════════════════════════════════════════════════════════════
+# CLASSIFICAÇÃO DE RISCO
+# ══════════════════════════════════════════════════════════════
+
+def classificar_risco(estado):
+    sintomas, sinais = [], []
+    if estado["sintomas"] not in (["NENHUM_SINTOMA"], ["INDEFINIDO"], []):
+        sintomas.extend(estado["sintomas"])
+    if estado["sinais"] not in (["NENHUM_SINAL"], ["INDEFINIDO"], []):
+        sinais.extend(estado["sinais"])
+    for item in estado["extras"]:
+        if item.startswith("S"): sintomas.append(item)
+        elif item.startswith("C"): sinais.append(item)
+
+    n_s = len(set(sintomas))
+    n_c = len(set(sinais))
+    total = n_s + n_c
+    d = estado["dias"] if estado["dias"] is not None else 0
+    tem_grave = any(s in SINAIS_GRAVES for s in sinais)
+
+    print(f"[RISCO] S={sorted(set(sintomas))} C={sorted(set(sinais))} "
+          f"n_s={n_s} n_c={n_c} total={total} dias={d} grave={tem_grave}")
+
+    if total == 0:
+        print("[RISCO] Regra 1 (nada) → BAIXO"); return "BAIXO"
+    if tem_grave:
+        print("[RISCO] Regra 2 (sinal grave) → ALTO"); return "ALTO"
+    if total >= 3:
+        print("[RISCO] Regra 3 (3+ itens) → ALTO"); return "ALTO"
+    if total == 2:
+        if d >= 2:
+            print("[RISCO] Regra 4a (2 itens persistentes) → ALTO"); return "ALTO"
+        print("[RISCO] Regra 4b (2 itens, 1 dia) → MEDIO"); return "MEDIO"
+    if d >= 2:
+        print("[RISCO] Regra 5a (1 item persistente) → MEDIO"); return "MEDIO"
+    print("[RISCO] Regra 5b (1 item isolado) → BAIXO"); return "BAIXO"
+
+
+# ══════════════════════════════════════════════════════════════
+# MÁQUINA DE ESTADOS
+# ══════════════════════════════════════════════════════════════
+
+def _finalizar(estado):
+    risco = classificar_risco(estado)
+    estado["risco"] = risco
+    estado["etapa"] = Etapa.ENCERRADO
+
+    off_topic = estado.get("extras_off_topic", [])
+
+    if risco == "BAIXO" and off_topic:
+        msg = (
+            "Obrigada por compartilhar! Sobre a recuperação da cesárea, "
+            "seus relatos não indicam sinais de alerta no momento. Continue "
+            "seguindo as orientações da equipe que acompanha sua recuperação "
+            "e mantenha os cuidados com a ferida." + OBSERVACAO_OFF_TOPIC
         )
-        return ConversationHandler.END
-    elif resposta == "SIM":
-        await update.message.reply_text(
-            "Maravilha! Antes, digite apenas as **iniciais do seu nome**.\n\n"
-            "💡 *Exemplos:*\n"
-            "• Patrícia Rodrigues Nunes → **PRN**\n"
-            "• Maria Silva → **MS**\n"
-            "• Ana Clara Santos → **ACS**\n\n"
-            "Por favor, digite apenas as iniciais:",
-            reply_markup=ReplyKeyboardRemove(),
-            parse_mode='Markdown'
-        )
-        return INICIAIS
-
-async def obter_iniciais(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    iniciais_input = update.message.text.upper()
-    
-    valido, resultado = validar_iniciais(iniciais_input)
-    
-    if not valido:
-        await update.message.reply_text(
-            f"✋ {resultado}\n\n"
-            "💡 *Digite apenas as iniciais:*\n"
-            "• Exemplo 1: PRN\n"
-            "• Exemplo 2: MS\n"
-            "• Exemplo 3: ACS\n\n"
-            "Por favor, digite novamente as iniciais:",
-            parse_mode='Markdown'
-        )
-        return INICIAIS
-    
-    context.user_data['paciente'].iniciais = resultado
-    await update.message.reply_text("Informe sua data de nascimento (ex: 08/11/1987):")
-    return DATA_NASCIMENTO
-
-async def obter_data_nascimento(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data_input = update.message.text
-    
-    valido, resultado = validar_data(data_input, "nascimento")
-    
-    if not valido:
-        await update.message.reply_text(
-            f"Data inválida! {resultado}\n"
-            "Por favor, digite no formato DD/MM/AAAA (ex: 08/11/1987):"
-        )
-        return DATA_NASCIMENTO
-    
-    context.user_data['paciente'].data_nascimento = data_input
-    await update.message.reply_text("Informe a data do parto (ex: 23/05/2025):")
-    return DATA_PARTO
-
-async def obter_data_parto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data_input = update.message.text
-    
-    valido, resultado = validar_data(data_input, "parto")
-    
-    if not valido:
-        await update.message.reply_text(
-            f"Data inválida! {resultado}\n"
-            "Por favor, digite no formato DD/MM/AAAA (ex: 23/05/2025):"
-        )
-        return DATA_PARTO
-    
-    context.user_data['paciente'].data_parto = data_input
-    
-    # Teclado apenas com opções numéricas
-    keyboard = [
-        [KeyboardButton("1 - Febre"), KeyboardButton("2 - Calafrio")],
-        [KeyboardButton("3 - Dor no corpo"), KeyboardButton("4 - Nenhum sintoma")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "Vamos às perguntas!\n\n"
-        "A. Você sente 1 ou mais desses sintomas abaixo? "
-        "📝 *Você pode escolher os números OU descrever com suas palavras*\n\n"
-        "1. Febre (temperatura ≥ 37,5°C)\n"
-        "2. Calafrio (tremedeira)\n"
-        "3. Dor no corpo\n"
-        "4. Nenhum dos sintomas\n\n"
-        "💡 *Dica: Pode digitar como preferir! Ex: \"estou com febre\" ou \"1\"*",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    return PERGUNTA_A
-
-#Função da pergunta A com spaCy
-async def pergunta_a(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    resposta = update.message.text
-    texto_original = resposta  # Guardar texto original
-    
-    #Processar com spaCy
-    sintomas_identificados = None
-    
-    # Se for número ou opção do botão, processa
-    if resposta in ['1', '2', '3', '4', '1 - Febre', '2 - Calafrio', '3 - Dor no corpo', '4 - Nenhum sintoma']:
-        # Extrai apenas o número se veio do botão
-        if ' - ' in resposta:
-            resposta_final = resposta.split(' - ')[0]
-        else:
-            resposta_final = resposta
-    # Se for texto, processa com spaCy
     else:
-        sintomas_identificados = identificar_sintomas(resposta)
-        
-        if sintomas_identificados:
-            if len(sintomas_identificados) == 1:
-                resposta_final = sintomas_identificados[0]
-            else:
-                resposta_final = ','.join(sintomas_identificados)
-            
-            # Feedback do que foi entendido
-            await update.message.reply_text(
-                f"✅ Entendi! Você mencionou: {', '.join(sintomas_identificados)}"
-            )
+        msg = MENSAGENS_ENCERRAMENTO.get(risco, MENSAGENS_ENCERRAMENTO["INDEFINIDO"])
+        if off_topic:
+            msg += OBSERVACAO_OFF_TOPIC
+
+    print(f"[FINALIZADO] risco={risco} off_topic={bool(off_topic)}")
+    return msg, estado
+
+
+def processar_mensagem(numero, texto, estado):
+    etapa = estado["etapa"]
+    t = texto.lower().strip()
+
+    if etapa not in (Etapa.INICIO, Etapa.ENCERRADO) and eh_confusao(texto):
+        estado["confusoes"] = estado.get("confusoes", 0) + 1
+        print(f"[CONFUSAO] etapa={etapa} tentativa={estado['confusoes']}")
+        if estado["confusoes"] >= 3:
+            return (
+                "Vejo que está difícil prosseguir. Se quiser, podemos "
+                "recomeçar do zero — envie /start.\n\n" +
+                MENSAGENS_REPETICAO.get(etapa, "Pode me contar novamente?")
+            ), estado
+        return MENSAGENS_REPETICAO.get(etapa, "Pode me contar novamente?"), estado
+
+    estado["confusoes"] = 0
+
+    if etapa == Etapa.INICIO:
+        estado["etapa"] = Etapa.CONSENTIMENTO
+        return MENSAGENS[Etapa.CONSENTIMENTO], estado
+
+    if etapa == Etapa.CONSENTIMENTO:
+        consent = parse_consentimento(texto)
+        estado["consentimento"] = consent
+        if consent == "CONFUSAO":
+            return MENSAGENS_REPETICAO[Etapa.CONSENTIMENTO], estado
+        if consent == "SAUDACAO":
+            return (
+                "Olá! Que bom falar com você. Para começarmos, posso fazer "
+                "algumas perguntas sobre como você está se sentindo? "
+                "(responda sim ou não)"
+            ), estado
+        if consent is False:
+            estado["etapa"] = Etapa.ENCERRADO
+            return (
+                "Entendo sua decisão e respeito. Mesmo assim, recomendo "
+                "fortemente que você continue o acompanhamento com sua equipe "
+                "médica ou de enfermagem. Se surgir qualquer sintoma "
+                "preocupante, procure atendimento. Cuide-se bem!\n\n"
+                " Para fazer um novo teste, envie /start."
+            ), estado
+        if consent is True:
+            estado["etapa"] = Etapa.SINTOMAS
+            return MENSAGENS[Etapa.SINTOMAS], estado
+        return (
+            "Desculpe, não entendi. Podemos prosseguir com algumas perguntas? "
+            "Responda sim ou não."
+        ), estado
+
+    if etapa == Etapa.SINTOMAS:
+        if t in ["sim", "s", "positivo", "yes", "aham", "uhum"]:
+            return (
+                "Quais sintomas você está sentindo? "
+                "(febre, calafrio ou dor no corpo)"
+            ), estado
+        sintomas = parse_sintomas(texto)
+
+        if sintomas == ["INDEFINIDO"]:
+            if eh_nao_sei(texto):
+                print("[SINTOMAS] 'não sei' → tratando como NENHUM_SINTOMA")
+                estado["sintomas"] = ["NENHUM_SINTOMA"]
+                estado["etapa"] = Etapa.SINAIS
+                return (
+                    "Tudo bem não ter certeza! Vou seguir com as próximas "
+                    "perguntas.\n\n" + MENSAGENS[Etapa.SINAIS]
+                ), estado
+
+            if menciona_cefaleia_ou_costas(texto):
+                print("[SINTOMAS] cefaleia/lombalgia detectada")
+                return MENSAGEM_CEFALEIA_COSTAS, estado
+
+            if eh_fora_do_escopo(texto):
+                print("[SINTOMAS] FORA_DO_ESCOPO detectado")
+                return MENSAGENS_FORA_ESCOPO[Etapa.SINTOMAS], estado
+
+            print("[SINTOMAS] INDEFINIDO — repetindo pergunta")
+            return MENSAGENS_REPETICAO[Etapa.SINTOMAS], estado
+
+        estado["sintomas"] = sintomas
+        if sintomas == ["NENHUM_SINTOMA"]:
+            estado["etapa"] = Etapa.SINAIS
+            return MENSAGENS[Etapa.SINAIS], estado
+        estado["etapa"] = Etapa.DIAS
+        return MENSAGENS[Etapa.DIAS], estado
+
+    if etapa == Etapa.DIAS:
+        if eh_nao_sei(texto):
+            print("[DIAS] 'não sei' → dias=None, avançando")
+            estado["dias"] = None
+            estado["etapa"] = Etapa.SINAIS
+            return (
+                "Tudo bem! Vou seguir sem essa informação. Se lembrar "
+                "depois, é só me avisar.\n\n" + MENSAGENS[Etapa.SINAIS]
+            ), estado
+        estado["dias"] = parse_dias(texto)
+        estado["etapa"] = Etapa.SINAIS
+        return MENSAGENS[Etapa.SINAIS], estado
+
+    if etapa == Etapa.SINAIS:
+        if t in ["sim", "s", "positivo", "yes", "aham", "uhum"]:
+            return (
+                "Quais sinais você notou? "
+                "(sangramento, secreção, vermelhidão, calor no local, "
+                "ponto aberto ou mal cheiro)"
+            ), estado
+        sinais = parse_sinais(texto)
+
+        if sinais == ["INDEFINIDO"]:
+            if eh_nao_sei(texto):
+                print("[SINAIS] 'não sei' → tratando como NENHUM_SINAL")
+                estado["sinais"] = ["NENHUM_SINAL"]
+                estado["etapa"] = Etapa.EXTRAS
+                return (
+                    "Tudo bem não ter certeza! Vou seguir com as próximas "
+                    "perguntas.\n\n" + MENSAGENS[Etapa.EXTRAS]
+                ), estado
+
+            if eh_fora_do_escopo(texto):
+                print("[SINAIS] FORA_DO_ESCOPO detectado")
+                return MENSAGENS_FORA_ESCOPO[Etapa.SINAIS], estado
+
+            print("[SINAIS] INDEFINIDO — repetindo pergunta")
+            return (
+                "Desculpe, não consegui entender. Você notou algum destes "
+                "sinais: sangramento, secreção, vermelhidão, calor no local, "
+                "ponto aberto ou mal cheiro? "
+                "(se não notou nenhum, responda 'não')"
+            ), estado
+
+        estado["sinais"] = sinais
+        estado["etapa"] = Etapa.EXTRAS
+        return MENSAGENS[Etapa.EXTRAS], estado
+
+    if etapa == Etapa.EXTRAS:
+        tipo, itens = parse_extras(texto)
+        if tipo == "NAO":
+            estado["extras"] = []
+            estado["extras_off_topic"] = []
+            return _finalizar(estado)
+        if tipo == "OFF_TOPIC":
+            estado["extras"] = []
+            estado["extras_off_topic"] = [texto]
+            return _finalizar(estado)
+        if tipo == "APENAS_SIM":
+            estado["etapa"] = Etapa.EXTRAS_DETALHE
+            return MENSAGENS[Etapa.EXTRAS_DETALHE], estado
+        if tipo == "DETALHE":
+            estado["extras"] = itens
+            estado["extras_off_topic"] = []
+            return _finalizar(estado)
+
+    if etapa == Etapa.EXTRAS_DETALHE:
+        tipo, itens = parse_extras(texto)
+        if tipo == "DETALHE":
+            estado["extras"] = itens
+            estado["extras_off_topic"] = []
+        elif tipo == "OFF_TOPIC":
+            estado["extras"] = []
+            estado["extras_off_topic"] = [texto]
         else:
-            # Se não entendeu, pede para tentar novamente
-            await update.message.reply_text(
-                "🤔 Não consegui identificar os sintomas. "
-                "Pode descrever melhor ou usar os números (1, 2, 3, 4)?\n\n"
-                "Exemplos:\n"
-                "• \"estou com febre\"\n" 
-                "• \"calafrios e dor\"\n"
-                "• \"não sinto nada\""
-            )
-            return PERGUNTA_A
-    
-    context.user_data['paciente'].respostas['pergunta_a'] = resposta_final
-    context.user_data['texto_original_a'] = texto_original  # Guardar original
-    
-    # Se resposta for "4" (nenhum sintoma), pula para pergunta C
-    if resposta_final == "4":
-        context.user_data['paciente'].respostas['pergunta_b'] = "NÃO SE APLICA"
-        
-        keyboard = [
-            [KeyboardButton("1 - Sangramento"), KeyboardButton("2 - Secreção")],
-            [KeyboardButton("3 - Vermelhidão"), KeyboardButton("4 - Calor local")],
-            [KeyboardButton("5 - Pontos abertos"), KeyboardButton("6 - Mal cheiro")],
-            [KeyboardButton("7 - Nenhum sinal")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-        
-        await update.message.reply_text(
-            "C. Por favor, nos responda: você percebe alguns desses sinais no local da sua cesariana? "
-            "📝 *Você pode escolher os números OU descrever com suas palavras*\n\n"
-            "1. Sangramento\n"
-            "2. Líquido amarelo, esverdeado ou marrom\n"
-            "3. Vermelhidão\n"
-            "4. Local dos pontos está quente\n"
-            "5. Abriu 1 ou mais pontos\n"
-            "6. Mal cheiro\n"
-            "7. Nenhum desses sinais\n\n"
-            "💡 *Dica: Pode digitar como preferir! Ex: \"está vermelho\" ou \"3\"*",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return PERGUNTA_C
-    else:
-        # Se respondeu 1, 2 ou 3, vai para pergunta B
-        keyboard = [
-            [KeyboardButton("1 - Desde a alta"), KeyboardButton("2 - 1-2 dias")],
-            [KeyboardButton("3 - 3+ dias")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-        
-        await update.message.reply_text(
-            "B. Dando continuidade, nos responda: Há quanto tempo sente esses sintomas?\n\n"
-            "1. Desde que saí do hospital\n"
-            "2. 1 ou 2 dias\n"
-            "3. 3 dias ou mais dias\n\n"
-            "Resposta:",
-            reply_markup=reply_markup
-        )
-        return PERGUNTA_B
+            estado["extras"] = []
+            estado["extras_off_topic"] = []
+        return _finalizar(estado)
 
-async def pergunta_b(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    resposta = update.message.text
-    
-    # Processar possíveis respostas em texto
-    if resposta in ['1', '2', '3', '1 - Desde a alta', '2 - 1-2 dias', '3 - 3+ dias']:
-        # Extrai apenas o número se veio do botão
-        if ' - ' in resposta:
-            resposta_final = resposta.split(' - ')[0]
+    if etapa == Etapa.ENCERRADO:
+        return (
+            "Esta conversa já foi encerrada. Se precisar de algo, procure "
+            "sua equipe médica ou de enfermagem. Cuide-se bem!\n\n"
+            "💡 Para fazer um novo teste, envie /start."
+        ), estado
+
+    return "Desculpe, algo deu errado. Pode repetir?", estado
+
+
+# ══════════════════════════════════════════════════════════════
+# FASTAPI
+# ══════════════════════════════════════════════════════════════
+
+app = FastAPI(title="Bot Cuidar — Telegram")
+conversas = {}
+
+
+def enviar_telegram(chat_id, texto):
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {"chat_id": chat_id, "text": texto}
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        print(f"[TELEGRAM ENVIO] status={r.status_code} resp={r.text[:300]}")
+    except Exception as e:
+        print(f"[ERRO TELEGRAM] {e}")
+
+
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    message = data.get("message")
+    if not message or "text" not in message:
+        return {"status": "ignored"}
+
+    chat_id = message["chat"]["id"]
+    texto = message["text"].strip()
+
+    is_first = chat_id not in conversas
+    if is_first:
+        conversas[chat_id] = novo_estado()
+
+    if quer_reiniciar(texto, conversas[chat_id]["etapa"]):
+        avisar = not (is_first and conversas[chat_id]["etapa"] == Etapa.INICIO)
+        conversas[chat_id] = novo_estado()
+        estado = conversas[chat_id]
+        resposta, estado = processar_mensagem(chat_id, "", estado)
+        conversas[chat_id] = estado
+        print(f"[{chat_id}] REINICIADO → etapa={estado['etapa']}")
+        if avisar:
+            enviar_telegram(chat_id, " Conversa reiniciada.\n\n" + resposta)
         else:
-            resposta_final = resposta
-    else:
-        texto = resposta.lower()
-        if any(palavra in texto for palavra in ['desde', 'alta', 'hospital']):
-            resposta_final = '1'
-        elif any(palavra in texto for palavra in ['1', 'um', 'dois', '2', 'poucos']):
-            resposta_final = '2'
-        elif any(palavra in texto for palavra in ['3', 'três', 'mais', 'vários']):
-            resposta_final = '3'
-        else:
-            resposta_final = resposta  # Guarda o texto original
-    
-    context.user_data['paciente'].respostas['pergunta_b'] = resposta_final
-    
-    keyboard = [
-        [KeyboardButton("1 - Sangramento"), KeyboardButton("2 - Secreção")],
-        [KeyboardButton("3 - Vermelhidão"), KeyboardButton("4 - Calor local")],
-        [KeyboardButton("5 - Pontos abertos"), KeyboardButton("6 - Mal cheiro")],
-        [KeyboardButton("7 - Nenhum sinal")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-    
-    await update.message.reply_text(
-        "C. Por favor, nos responda: você percebe alguns desses sinais no local da sua cesariana? "
-        "📝 *Você pode escolher os números OU descrever com suas palavras*\n\n"
-        "1. Sangramento\n"
-        "2. Líquido amarelo, esverdeado ou marrom\n"
-        "3. Vermelhidão\n"
-        "4. Local dos pontos está quente\n"
-        "5. Abriu 1 ou mais pontos\n"
-        "6. Mal cheiro\n"
-        "7. Nenhum desses sinais\n\n"
-        "💡 *Dica: Pode digitar como preferir! Ex: \"está vermelho\" ou \"3\"*",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    return PERGUNTA_C
+            enviar_telegram(chat_id, resposta)
+        return {"status": "ok"}
 
-#Função da pergunta C com spaCy
-async def pergunta_c(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    resposta = update.message.text
-    texto_original = resposta  # Guardar texto original
-    
-    #Processar com spaCy
-    sinais_identificados = None
-    
-    # Se for número ou opção do botão, processa
-    if resposta in ['1', '2', '3', '4', '5', '6', '7', 
-                   '1 - Sangramento', '2 - Secreção', '3 - Vermelhidão',
-                   '4 - Calor local', '5 - Pontos abertos', '6 - Mal cheiro', 
-                   '7 - Nenhum sinal']:
-        # Extrai apenas o número se veio do botão
-        if ' - ' in resposta:
-            resposta_final = resposta.split(' - ')[0]
-        else:
-            resposta_final = resposta
-    # Se for texto, processa com spaCy
-    else:
-        sinais_identificados = identificar_sinais_cesariana(resposta)
-        
-        if sinais_identificados:
-            if len(sinais_identificados) == 1:
-                resposta_final = sinais_identificados[0]
-            else:
-                resposta_final = ','.join(sinais_identificados)
-            
-            # Feedback do que foi entendido
-            await update.message.reply_text(
-                f"✅ Entendi! Você mencionou: {', '.join(sinais_identificados)}"
-            )
-        else:
-            # Se não entendeu, usa texto original
-            resposta_final = resposta
-            await update.message.reply_text(
-                "⚠️ Registrei sua descrição. Vamos analisar suas respostas."
-            )
-    
-    context.user_data['paciente'].respostas['pergunta_c'] = resposta_final
-    context.user_data['texto_original_c'] = texto_original  # Guardar original
-    
-    # Análise dos resultados
-    recomendacao, alerta_risco = analisar_respostas(context.user_data['paciente'])
-    
-    # Salva os dados no CSV
-    sucesso = salvar_no_csv(
-        context.user_data['paciente'],
-        context.user_data['paciente'].telegram_user_id,
-        recomendacao,
-        alerta_risco,
-        context.user_data.get('texto_original_a', ''),
-        context.user_data.get('texto_original_c', '')
-    )
-    
-    mensagem_final = f"Pronto, terminamos! Muito obrigado por sua participação.\n\n{recomendacao}"
-    
-    if not sucesso:
-        mensagem_final += "\n\n⚠️ Observação: Houve um problema técnico ao salvar seus dados."
-    
-    #Remove o teclado ao final
-    await update.message.reply_text(
-        mensagem_final,
-        reply_markup=ReplyKeyboardRemove(),
-        parse_mode='Markdown'
-    )
-    
-    # Log dos dados
-    logging.info(f"Paciente: {context.user_data['paciente'].iniciais}")
-    logging.info(f"Data parto: {context.user_data['paciente'].data_parto}")
-    logging.info(f"Respostas: {context.user_data['paciente'].respostas}")
-    logging.info(f"Recomendação: {recomendacao}")
-    logging.info(f"Alerta Risco: {alerta_risco}")
-    
-    # Limpa os dados da conversa
-    context.user_data.clear()
-    
-    return ConversationHandler.END
+    estado = conversas[chat_id]
+    resposta, estado = processar_mensagem(chat_id, texto, estado)
+    conversas[chat_id] = estado
+    print(f"[{chat_id}] etapa={estado['etapa']} risco={estado['risco']}")
+    enviar_telegram(chat_id, resposta)
+    return {"status": "ok"}
 
-def analisar_respostas(paciente):
-    respostas = paciente.respostas
-    
-    # Contar sinais e sintomas
-    sinais_sintomas_count = 0
-    
-    # Verificar sintomas (Pergunta A)
-    pergunta_a = respostas.get('pergunta_a', '')
-    if pergunta_a and pergunta_a != '4':  # Se não for "nenhum sintoma"
-        sinais_sintomas_count += len(pergunta_a.split(',')) if ',' in pergunta_a else 1
-    
-    # Verificar sinais locais (Pergunta C)
-    pergunta_c = respostas.get('pergunta_c', '')
-    if pergunta_c and pergunta_c != '7':  # Se não for "nenhum sinal"
-        sinais_sintomas_count += len(pergunta_c.split(',')) if ',' in pergunta_c else 1
-    
-    # CENÁRIO 1: 2 ou mais sinais/sintomas -> ALERTA VERMELHO
-    if sinais_sintomas_count >= 2:
-        recomendacao = "🚨 Baseado em suas respostas recomendamos que você retorne com urgência à maternidade onde fez sua cesariana para que seja avaliada por uma profissional de saúde."
-        alerta_risco = "VERMELHO"
-    
-    # CENÁRIO 2: Nenhum sinal/sintoma -> Consulta de rotina
-    else:
-        recomendacao = "Baseado em suas respostas, recomendamos que retorne à unidade de saúde onde fez seu pré-natal para consulta do puerpério ou resguardo com sua médica ou enfermeiro."
-        alerta_risco = "BAIXO"
-    
-    return recomendacao, alerta_risco
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Conversa interrompida. Se precisar reiniciar, envie qualquer mensagem ou use /start.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    context.user_data.clear()
-    return ConversationHandler.END
+@app.get("/")
+async def raiz():
+    return {"status": "ok", "bot": "Bot Cuidar — Telegram"}
 
-def main():
-    # Inicializa o arquivo CSV
-    inicializar_csv()
-    
-    # Verificar se spaCy está disponível
-    if not SPACY_AVAILABLE:
-        print("AVISO: spaCy não está disponível. Usando sistema de fallback.")
-        print("Para melhor experiência, instale: pip install spacy && python -m spacy download pt_core_news_sm")
-    
-    # Token do bot
-    TOKEN = "8441175313:AAF3UlhGCijQwZR09aQNFuN372DMPIL4Hgs"
-    
-    application = Application.builder().token(TOKEN).build()
 
-    #Conversation handler com entrada para QUALQUER mensagem
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('start', start),  # Mantém o comando /start
-            MessageHandler(filters.TEXT & ~filters.COMMAND, iniciar_conversa)  # 🔥 NOVO: Qualquer mensagem inicia
-        ],
-        states={
-            ACEITAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, aceitar_conversa)],
-            INICIAIS: [MessageHandler(filters.TEXT & ~filters.COMMAND, obter_iniciais)],
-            DATA_NASCIMENTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, obter_data_nascimento)],
-            DATA_PARTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, obter_data_parto)],
-            PERGUNTA_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_a)],
-            PERGUNTA_B: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_b)],
-            PERGUNTA_C: [MessageHandler(filters.TEXT & ~filters.COMMAND, pergunta_c)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-
-    application.add_handler(conv_handler)
-
-    print("Bot de monitoramento pós-cesárea COM spaCy está rodando...")
-    print(f"Os dados serão salvos no arquivo: {CSV_FILENAME}")
-    print("Agora o bot inicia com QUALQUER mensagem ou com /start")
-    if SPACY_AVAILABLE:
-        print("spaCy ativo - Chatbot entendendo linguagem natural!")
-    else:
-        print("spaCy inativo - Usando sistema básico")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
